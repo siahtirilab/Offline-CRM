@@ -4,7 +4,7 @@ $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $projectRoot
 
 $appName = "OfflineCRM"
-$version = "2"
+$version = "8"
 $desktopIcon = Join-Path $env:USERPROFILE "Desktop\Icon.png"
 $projectIconPng = Join-Path $projectRoot "Icon.png"
 $projectIconIco = Join-Path $projectRoot "Icon.ico"

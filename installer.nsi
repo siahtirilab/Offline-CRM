@@ -3,13 +3,13 @@ Unicode True
 !include "LogicLib.nsh"
 
 !define APP_NAME "Offline CRM"
-!define APP_VERSION "2"
+!define APP_VERSION "8"
 !define APP_PUBLISHER "Siahtiri Lab"
 !define LEGACY_APP_PUBLISHER "POWEREN"
 !define APP_WEBSITE "https://github.com/siahtirilab/Offline-CRM"
 !define APP_GITHUB "https://github.com/siahtirilab/Offline-CRM"
 !define APP_EXE "OfflineCRM.exe"
-!define OUTPUT_NAME "OfflineCRM_Setup_v2.exe"
+!define OUTPUT_NAME "OfflineCRM_Setup_v8.exe"
 !define APP_DATA_ROOT "$LOCALAPPDATA\OfflineCRM"
 !define APP_DATA_DIR "$LOCALAPPDATA\OfflineCRM\data"
 

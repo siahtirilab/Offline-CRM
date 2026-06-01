@@ -1,6 +1,7 @@
 ﻿import csv
 import getpass
 import calendar
+import ast
 import json
 import os
 import re
@@ -17,9 +18,11 @@ from pathlib import Path
 from typing import Callable
 
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import colorchooser, filedialog, simpledialog, ttk
 
 import jdatetime
+import iranholidays
 from openpyxl import Workbook, load_workbook
 from PIL import Image, ImageDraw
 import pystray
@@ -41,13 +44,18 @@ except ImportError:  # pragma: no cover
 
 
 APP_TITLE = "Offline CRM"
-APP_VERSION = "2"
+APP_VERSION = "8"
+APP_FONT_FAMILY = "IRANSans"
 APP_NOTIFY_ID = "CRM_Sales_App"
+APP_WEBSITE_URL = "https://siahtiri.ir"
+APP_GITHUB_URL = "https://github.com/siahtirilab/Offline-CRM"
+APP_SUPPORT_EMAIL = "siahtirim@gmail.com"
+APP_UPDATE_CHECK_DAYS = 60
 APP_ICON_CANDIDATES = [
     Path(__file__).resolve().parent / "Icon.png",
     Path.home() / "Desktop" / "Icon.png",
 ]
-CUSTOMER_FIELDS = ["id", "name", "mobile", "birthdate", "income_level", "birthday_notified_for", "birthday_seen_for", "created_at", "updated_at"]
+CUSTOMER_FIELDS = ["id", "name", "mobile", "mobile2", "birthdate", "income_level", "birthday_notified_for", "birthday_seen_for", "created_at", "updated_at"]
 DEAL_FIELDS = [
     "id",
     "customer_id",
@@ -79,11 +87,28 @@ DEFAULT_CATEGORIES = ["سرنخ جدید", "تماس اولیه", "پیگیری 
 DEFAULT_PIPELINES = ["ورودی وب", "ورودی تلفنی", "ارجاعی", "همکاری سازمانی"]
 INCOME_LEVELS = ["ضعیف", "متوسط", "خوب", "عالی"]
 DEFAULT_CATEGORY_COLORS = ["#e76f51", "#f4a261", "#e9c46a", "#2a9d8f", "#457b9d", "#8d99ae", "#9c6644"]
+CALENDAR_HOLIDAY_BG = "#b28dff"
+CALENDAR_HOLIDAY_ACTIVE_BG = "#9b6dff"
+CALENDAR_HOLIDAY_FG = "#4b1d8f"
+CALENDAR_HOLIDAY_SELECTED_FG = "#ffffff"
 STATUS_META = {
     "در دست بررسی": {"emoji": "ðŸŸ¨", "color": "#f4a261"},
     "موفق": {"emoji": "🟩", "color": "#2a9d8f"},
     "ناموفق": {"emoji": "🟥", "color": "#e76f51"},
 }
+
+
+def configure_app_font(root) -> str:
+    global APP_FONT_FAMILY
+    try:
+        available = set(tkfont.families(root))
+        for name in ("IRANSans", "IRANSansWeb", "IranSans", "IRANSansX", "Tahoma"):
+            if name in available:
+                APP_FONT_FAMILY = name
+                break
+    except Exception:
+        pass
+    return APP_FONT_FAMILY
 DATASET_CONFIG = {
     "مشتریان": ("customers.csv", CUSTOMER_FIELDS),
     "معاملات": ("deals.csv", DEAL_FIELDS),
@@ -91,6 +116,7 @@ DATASET_CONFIG = {
     "دسته‌بندی‌های معامله": ("categories.csv", CATEGORY_FIELDS),
     "نوع معامله": ("deal_types.csv", DEAL_TYPE_FIELDS),
     "محصولات نوع معامله": ("products.csv", PRODUCT_FIELDS),
+    "گزارش درآمدی": ("income_report.xlsx", ["sales_expert", "success_at", "deal_type", "product", "sale_price", "operator_commission"]),
 }
 PERSIAN_MONTHS = [
     "فروردین",
@@ -109,6 +135,13 @@ PERSIAN_MONTHS = [
 WINDOWS_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 WINDOWS_RUN_VALUE = "OfflineCRM"
 APP_SETTINGS_FILENAME = "app_settings.json"
+DEFAULT_NOTE_TEMPLATES = [
+    "سلام وقت شما بخیر. برای پیگیری معامله تماس گرفتم.",
+    "مشتری درخواست بررسی بیشتر و تماس مجدد در زمان مناسب‌تر را دارد.",
+    "پیشنهاد قیمت ارسال شد و منتظر پاسخ مشتری هستیم.",
+    "مشتری برای خرید اعلام آمادگی کرده و نیاز به هماهنگی نهایی دارد.",
+    "مشتری فعلاً منصرف شده و نیاز به پیگیری در آینده دارد.",
+]
 
 
 def default_local_appdata_root() -> Path:
@@ -328,12 +361,29 @@ def app_settings_path_for_profile(profile: "ProfileContext") -> Path:
 
 
 def load_app_settings(settings_path: Path) -> dict:
+    defaults = {
+        "launch_on_startup": True,
+        "last_update_prompt_at": "",
+        "show_dashboard_commission": True,
+        "note_templates": list(DEFAULT_NOTE_TEMPLATES),
+    }
     if not settings_path.exists():
-        return {"launch_on_startup": True}
+        return defaults
     try:
-        return json.loads(settings_path.read_text(encoding="utf-8"))
+        payload = json.loads(settings_path.read_text(encoding="utf-8"))
+        payload.setdefault("launch_on_startup", defaults["launch_on_startup"])
+        payload.setdefault("last_update_prompt_at", defaults["last_update_prompt_at"])
+        payload.setdefault("show_dashboard_commission", defaults["show_dashboard_commission"])
+        templates = payload.get("note_templates")
+        if not isinstance(templates, list):
+            templates = list(DEFAULT_NOTE_TEMPLATES)
+        templates = [str(item or "").strip() for item in templates[:5]]
+        while len(templates) < 5:
+            templates.append(DEFAULT_NOTE_TEMPLATES[len(templates)])
+        payload["note_templates"] = templates
+        return payload
     except (OSError, json.JSONDecodeError):
-        return {"launch_on_startup": True}
+        return defaults
 
 
 def save_app_settings(settings_path: Path, settings: dict) -> None:
@@ -371,15 +421,30 @@ def shorten_text(value: str, limit: int = 70) -> str:
 
 
 RICH_NOTE_PREFIX = "__RICH_TEXT__:"
+LEGACY_RICH_NOTE_PREFIX = "__RICH_TEXT__"
+RTL_EDITOR_PREFIX = "\u202B"
+RTL_EDITOR_SUFFIX = "\u202C"
 
 
 def decode_rich_note(value: str) -> dict | None:
-    if not isinstance(value, str) or not value.startswith(RICH_NOTE_PREFIX):
+    if not isinstance(value, str):
+        return None
+    payload_text = ""
+    if value.startswith(RICH_NOTE_PREFIX):
+        payload_text = value[len(RICH_NOTE_PREFIX) :]
+    elif value.startswith(LEGACY_RICH_NOTE_PREFIX):
+        payload_text = value[len(LEGACY_RICH_NOTE_PREFIX) :].lstrip(":")
+    else:
         return None
     try:
-        return json.loads(value[len(RICH_NOTE_PREFIX) :])
+        payload = json.loads(payload_text)
+        return payload if isinstance(payload, dict) else None
     except json.JSONDecodeError:
-        return None
+        try:
+            payload = ast.literal_eval(payload_text)
+            return payload if isinstance(payload, dict) else None
+        except (ValueError, SyntaxError):
+            return None
 
 
 def note_plain_text(value: str) -> str:
@@ -389,8 +454,35 @@ def note_plain_text(value: str) -> str:
     return value or ""
 
 
+def wrap_editor_rtl_text(value: str) -> str:
+    text = value or ""
+    if text.startswith(RTL_EDITOR_PREFIX) and text.endswith(RTL_EDITOR_SUFFIX):
+        return text
+    return f"{RTL_EDITOR_PREFIX}{text}{RTL_EDITOR_SUFFIX}"
+
+
+def unwrap_editor_rtl_text(value: str) -> str:
+    text = value or ""
+    if text.startswith(RTL_EDITOR_PREFIX):
+        text = text[len(RTL_EDITOR_PREFIX) :]
+    if text.endswith(RTL_EDITOR_SUFFIX):
+        text = text[: -len(RTL_EDITOR_SUFFIX)]
+    return text
+
+
+def normalize_note_preview_line(line: str) -> str:
+    raw_line = (line or "").strip()
+    if not raw_line:
+        return ""
+    payload = decode_rich_note(raw_line)
+    if payload:
+        return str(payload.get("text", "") or "").strip()
+    return raw_line
+
+
 def note_preview_text(value: str, limit: int = 90) -> str:
-    lines = [line.strip() for line in note_plain_text(value).splitlines() if line.strip()]
+    lines = [normalize_note_preview_line(line) for line in note_plain_text(value).splitlines()]
+    lines = [line for line in lines if line.strip()]
     if not lines:
         return ""
     chosen = ""
@@ -494,6 +586,7 @@ def normalize_keyboard_text(value: str) -> str:
 
 
 def normalize_persian_editor_text(value: str) -> str:
+    text = value or ""
     mapping = str.maketrans(
         {
             "ي": "ی",
@@ -504,10 +597,17 @@ def normalize_persian_editor_text(value: str) -> str:
             "إ": "ا",
             "أ": "ا",
             "ئ": "ی",
-            "‌ ": " ",
         }
     )
-    return (value or "").translate(mapping)
+    return text.translate(mapping).replace("‌ ", " ")
+
+
+def jalali_holiday_title(year: int, month: int, day: int) -> str:
+    try:
+        return str(iranholidays.off_occasion_ymd(year, month, day, "S") or "").strip()
+    except Exception:
+        gregorian_weekday = jdatetime.date(year, month, day).togregorian().weekday()
+        return "Weekend" if gregorian_weekday == 4 else ""
 
 
 def matches_search(query: str, *values: str) -> bool:
@@ -827,6 +927,19 @@ class CrmStore:
     def save_products(self, rows: list[dict]) -> None:
         self.repo.write_rows("products.csv", PRODUCT_FIELDS, rows)
 
+    def reset_all_data(self) -> None:
+        self.save_customers([])
+        self.save_deals([])
+        self.save_categories(
+            [
+                {"id": uuid.uuid4().hex, "title": item, "color": DEFAULT_CATEGORY_COLORS[index % len(DEFAULT_CATEGORY_COLORS)]}
+                for index, item in enumerate(DEFAULT_CATEGORIES)
+            ]
+        )
+        self.save_pipelines([{"id": uuid.uuid4().hex, "title": item} for item in DEFAULT_PIPELINES])
+        self.save_deal_types([{"id": uuid.uuid4().hex, "title": item} for item in DEFAULT_DEAL_TYPES])
+        self.save_products([])
+
 
 class JalaliDatePickerDialog(tb.Toplevel):
     def __init__(self, master, initial_value: str = "", reminder_counter: Callable[[int, int], dict[int, int]] | None = None):
@@ -846,7 +959,7 @@ class JalaliDatePickerDialog(tb.Toplevel):
         else:
             jalali = jdatetime.datetime.now()
 
-        wrapper = tb.Frame(self, padding=16)
+        wrapper = tb.Frame(self, padding=14)
         wrapper.pack(fill=BOTH, expand=True)
 
         selectors = tb.Frame(wrapper)
@@ -869,7 +982,7 @@ class JalaliDatePickerDialog(tb.Toplevel):
         self.month_combo.pack(fill=X)
         self.month_combo.bind("<<ComboboxSelected>>", lambda _event: self._normalize_day())
 
-        self.month_label = rtl_label(wrapper, "", font=("Tahoma", 11, "bold"))
+        self.month_label = rtl_label(wrapper, "", font=(APP_FONT_FAMILY, 11, "bold"))
         self.month_label.pack(fill=X, pady=(8, 10))
         self.month_summary_label = rtl_label(wrapper, "", bootstyle="info")
         self.month_summary_label.pack(fill=X, pady=(0, 6))
@@ -902,17 +1015,21 @@ class JalaliDatePickerDialog(tb.Toplevel):
             item.destroy()
         weekday_headers = ["ش", "ی", "د", "س", "چ", "پ", "ج"]
         for column, label in enumerate(weekday_headers):
-            header = rtl_label(self.days_frame, label, font=("Tahoma", 10, "bold"))
+            header = rtl_label(self.days_frame, label, font=(APP_FONT_FAMILY, 10, "bold"))
             header.grid(row=0, column=column, sticky="nsew", padx=3, pady=(0, 6))
             self.days_frame.columnconfigure(column, weight=1)
+        first_day_gregorian_weekday = jdatetime.date(year, month, 1).togregorian().weekday()
+        first_day_column = (first_day_gregorian_weekday + 2) % 7
         for day in range(1, max_day + 1):
-            row = ((day - 1) // 7) + 1
-            column = (day - 1) % 7
+            absolute_index = first_day_column + (day - 1)
+            row = (absolute_index // 7) + 1
+            column = absolute_index % 7
+            holiday_title = jalali_holiday_title(year, month, day)
+            is_holiday = bool(holiday_title)
             cell = tb.Frame(self.days_frame, padding=(4, 6), bootstyle="light")
             cell.grid(row=row, column=column, sticky="nsew", padx=3, pady=3)
             cell.configure(height=78, width=58)
             cell.grid_propagate(False)
-            style = "success" if day == self.day_var.get() else "light-outline"
             day_button = tk.Button(
                 cell,
                 text=str(day),
@@ -920,17 +1037,53 @@ class JalaliDatePickerDialog(tb.Toplevel):
                 relief="flat",
                 bd=0,
                 cursor="hand2",
-                font=("Tahoma", 10, "bold"),
-                fg="#111111",
-                activeforeground="#111111",
+                font=(APP_FONT_FAMILY, 10, "bold"),
             )
             if day == self.day_var.get():
-                day_button.configure(bg="#20c997", activebackground="#18b18b")
+                if is_holiday:
+                    day_button.configure(
+                        bg=CALENDAR_HOLIDAY_ACTIVE_BG,
+                        activebackground=CALENDAR_HOLIDAY_ACTIVE_BG,
+                        fg=CALENDAR_HOLIDAY_SELECTED_FG,
+                        activeforeground=CALENDAR_HOLIDAY_SELECTED_FG,
+                    )
+                else:
+                    day_button.configure(
+                        bg="#20c997",
+                        activebackground="#18b18b",
+                        fg="#111111",
+                        activeforeground="#111111",
+                    )
             else:
-                day_button.configure(bg="#000000", activebackground="#232527", highlightbackground="#242424")
+                if is_holiday:
+                    day_button.configure(
+                        bg=CALENDAR_HOLIDAY_BG,
+                        activebackground=CALENDAR_HOLIDAY_BG,
+                        fg=CALENDAR_HOLIDAY_FG,
+                        activeforeground=CALENDAR_HOLIDAY_FG,
+                    )
+                else:
+                    day_button.configure(
+                        bg="#ffffff",
+                        activebackground="#f1f3f5",
+                        fg="#111111",
+                        activeforeground="#111111",
+                        highlightbackground="#d9dee3",
+                    )
             day_button.pack(fill=X)
             count = reminder_counts.get(day, 0)
-            rtl_label(cell, f"{count} یادآور" if count else "", font=("Tahoma", 8), bootstyle="secondary").pack(fill=X, pady=(6, 0))
+            detail_parts = []
+            if count:
+                detail_parts.append(f"{count} یادآور")
+            if holiday_title and holiday_title != "Weekend":
+                detail_parts.append("تعطیل رسمی")
+            detail_label = rtl_label(
+                cell,
+                " | ".join(detail_parts),
+                font=(APP_FONT_FAMILY, 8),
+                bootstyle="secondary" if not is_holiday else "primary",
+            )
+            detail_label.pack(fill=X, pady=(6, 0))
 
     def save(self):
         self.result = f"{int(self.year_var.get()):04d}/{int(self.month_var.get()):02d}/{int(self.day_var.get()):02d}"
@@ -1055,7 +1208,7 @@ class SearchableCombobox(tb.Entry):
         wrapper.pack(fill=BOTH, expand=True)
         scrollbar = tb.Scrollbar(wrapper, orient="vertical")
         scrollbar.pack(side=LEFT, fill=Y)
-        self.listbox = tk.Listbox(wrapper, height=6, font=("Tahoma", 10), activestyle="none", justify="right", yscrollcommand=scrollbar.set)
+        self.listbox = tk.Listbox(wrapper, height=6, font=(APP_FONT_FAMILY, 10), activestyle="none", justify="right", yscrollcommand=scrollbar.set)
         self.listbox.pack(side=RIGHT, fill=BOTH, expand=True)
         scrollbar.configure(command=self.listbox.yview)
         self.listbox.bind("<ButtonRelease-1>", self.select_from_list)
@@ -1140,7 +1293,7 @@ class ProfileDialog(tb.Toplevel):
 
         wrapper = tb.Frame(self, padding=18)
         wrapper.pack(fill=BOTH, expand=True)
-        rtl_label(wrapper, f"کاربر ویندوز: {getpass.getuser()}", font=("Tahoma", 11, "bold")).pack(fill=X)
+        rtl_label(wrapper, f"کاربر ویندوز: {getpass.getuser()}", font=(APP_FONT_FAMILY, 11, "bold")).pack(fill=X)
         rtl_label(
             wrapper,
             "برای شروع یک پروفایل اختصاصی بسازید یا یکی از پروفایل‌های قبلی را باز کنید.",
@@ -1259,8 +1412,9 @@ class CustomerDialog(tb.Toplevel):
         self.open_deal_callback = open_deal_callback
         self.existing_mobiles = set(existing_mobiles or [])
         self.original_mobile = customer.get("mobile", "") if customer else ""
+        self.original_mobile2 = customer.get("mobile2", "") if customer else ""
         self.title("ثبت مشتری" if not customer else "ویرایش مشتری")
-        self.geometry("874x620" if customer else "706x360")
+        self.geometry("1374x770" if customer else "706x660")
         self.resizable(False, False)
         self.transient(master)
         self.grab_set()
@@ -1268,12 +1422,12 @@ class CustomerDialog(tb.Toplevel):
         wrapper = tb.Frame(self, padding=16)
         wrapper.pack(fill=BOTH, expand=True)
         self.entries: dict[str, object] = {}
-        for key, title in [("name", "نام"), ("mobile", "شماره موبایل")]:
+        for key, title in [("name", "نام"), ("mobile", "شماره موبایل"), ("mobile2", "شماره دوم")]:
             rtl_label(wrapper, title).pack(fill=X, pady=(0, 4))
             entry = tb.Entry(wrapper, justify="right")
             entry.pack(fill=X, pady=(0, 10))
             self.entries[key] = entry
-            if key == "mobile":
+            if key == "mobile2":
                 self.mobile_error = rtl_label(wrapper, "", bootstyle="danger")
                 self.mobile_error.pack(fill=X, pady=(0, 8))
 
@@ -1284,7 +1438,7 @@ class CustomerDialog(tb.Toplevel):
         self.entries["income_level"] = income_combo
 
         rtl_label(wrapper, "تاریخ تولد").pack(fill=X, pady=(0, 4))
-        birthdate = JalaliDateField(wrapper)
+        birthdate = JalaliDateField(wrapper, allow_empty=True)
         birthdate.pack(fill=X, pady=(0, 12))
         self.entries["birthdate"] = birthdate
 
@@ -1299,19 +1453,46 @@ class CustomerDialog(tb.Toplevel):
             deals_box.pack(fill=BOTH, expand=True, pady=(14, 0))
             deals_body = tb.Frame(deals_box, padding=10)
             deals_body.pack(fill=BOTH, expand=True)
-            self.deals_tree = ttk.Treeview(deals_body, columns=("title", "status", "price", "reminder"), show="headings", height=8)
-            for key, title, width in [("title", "عنوان", 180), ("status", "وضعیت", 110), ("price", "قیمت", 100), ("reminder", "یادآور", 120)]:
+            self.deals_tree = ttk.Treeview(
+                deals_body,
+                columns=("title", "category", "status", "product", "created", "reminder", "notes"),
+                show="headings",
+                height=8,
+            )
+            for key, title, width in [
+                ("title", "عنوان", 120),
+                ("category", "دسته‌بندی", 110),
+                ("status", "وضعیت", 120),
+                ("product", "محصول", 120),
+                ("created", "تاریخ ایجاد", 120),
+                ("reminder", "یادآور", 150),
+                ("notes", "یادداشت", 280),
+            ]:
                 self.deals_tree.heading(key, text=title)
                 self.deals_tree.column(key, width=width, anchor="e")
+            self.deals_tree["displaycolumns"] = ("notes", "reminder", "created", "product", "status", "category", "title")
             self.deals_tree.pack(fill=BOTH, expand=True)
             self.deals_tree.bind("<Double-1>", self.open_deal_from_tree)
             for deal in deals or []:
-                status_label = status_display(deal["status"])
-                self.deals_tree.insert("", END, iid=deal["id"], values=(deal["title"], status_label, deal["sale_price"], deal["reminder_at"]))
+                self.deals_tree.insert(
+                    "",
+                    END,
+                    iid=deal["id"],
+                    values=(
+                        deal.get("title", ""),
+                        deal.get("category", ""),
+                        deal.get("status", ""),
+                        deal.get("product", ""),
+                        (deal.get("created_at", "").split(" ")[0]),
+                        deal.get("reminder_at", ""),
+                        note_preview_text(deal.get("notes", ""), limit=80) or "-",
+                    ),
+                )
 
         if customer:
             self.entries["name"].insert(0, customer.get("name", ""))
             self.entries["mobile"].insert(0, customer.get("mobile", ""))
+            self.entries["mobile2"].insert(0, customer.get("mobile2", ""))
             self.entries["income_level"].set(customer.get("income_level", INCOME_LEVELS[1]))
             birthdate.set(customer.get("birthdate", ""))
 
@@ -1320,16 +1501,24 @@ class CustomerDialog(tb.Toplevel):
     def save(self):
         name = self.entries["name"].get().strip()
         mobile = self.entries["mobile"].get().strip()
+        mobile2 = self.entries["mobile2"].get().strip()
         self.mobile_error.configure(text="")
         if not name or not mobile:
             Messagebox.show_error("نام و شماره موبایل الزامی است.", "خطا", parent=self)
             return
-        if mobile != self.original_mobile and mobile in self.existing_mobiles:
+        if mobile2 and mobile2 == mobile:
+            self.mobile_error.configure(text="شماره دوم نباید با شماره اصلی یکسان باشد.")
+            return
+        other_mobiles = set(self.existing_mobiles)
+        other_mobiles.discard(self.original_mobile)
+        other_mobiles.discard(self.original_mobile2)
+        if mobile in other_mobiles or (mobile2 and mobile2 in other_mobiles):
             self.mobile_error.configure(text="این شماره تکراری است.")
             return
         self.result = {
             "name": name,
             "mobile": mobile,
+            "mobile2": mobile2,
             "income_level": self.entries["income_level"].get().strip(),
             "birthdate": self.entries["birthdate"].get().strip(),
             "birthday_notified_for": "",
@@ -1570,13 +1759,57 @@ class ProductManager(tb.LabelFrame):
         self.save_callback(self.rows)
 
 
+class NoteTemplateManagerDialog(tb.Toplevel):
+    def __init__(self, master, templates: list[str]):
+        super().__init__(master)
+        self.result = None
+        self.title("ویرایش متن‌های آماده")
+        self.geometry("760x560")
+        self.transient(master)
+        self.grab_set()
+        bind_edit_shortcuts(self)
+
+        wrapper = tb.Frame(self, padding=16)
+        wrapper.pack(fill=BOTH, expand=True)
+        rtl_label(wrapper, "۵ متن آماده برای یادداشت معامله").pack(fill=X, pady=(0, 10))
+        self.editors: list[tk.Text] = []
+        for index in range(5):
+            box = tb.LabelFrame(wrapper, text=f"متن آماده {index + 1}")
+            box.pack(fill=BOTH, expand=True, pady=4)
+            body = tb.Frame(box, padding=8)
+            body.pack(fill=BOTH, expand=True)
+            editor = tk.Text(body, height=4, wrap="word", font=(APP_FONT_FAMILY, 10), padx=8, pady=6)
+            editor.pack(fill=BOTH, expand=True)
+            editor.insert("1.0", templates[index] if index < len(templates) else "")
+            self.editors.append(editor)
+
+        actions = tb.Frame(wrapper)
+        actions.pack(fill=X, pady=(12, 0))
+        tb.Button(actions, text="ذخیره", bootstyle="success", command=self.save).pack(side=RIGHT, padx=4)
+        tb.Button(actions, text="انصراف", bootstyle="secondary", command=self.destroy).pack(side=RIGHT, padx=4)
+        bind_primary_action(self, self.save)
+        self.wait_window(self)
+
+    def save(self):
+        templates = []
+        for index, editor in enumerate(self.editors):
+            value = editor.get("1.0", "end-1c").strip()
+            templates.append(value or DEFAULT_NOTE_TEMPLATES[index])
+        self.result = templates
+        self.destroy()
+
+
 class NoteEditorDialog(tb.Toplevel):
     RICH_TAGS = ("bold", "italic", "underline", "heading", "link", "timestamp", "quote")
 
-    def __init__(self, master, note: dict[str, str] | None = None):
+    def __init__(self, master, note: dict[str, str] | None = None, templates: list[str] | None = None, save_templates_callback: Callable[[list[str]], None] | None = None):
         super().__init__(master)
         self.result = None
         self.original_note = dict(note) if note else None
+        self.templates = list(templates or DEFAULT_NOTE_TEMPLATES)
+        while len(self.templates) < 5:
+            self.templates.append(DEFAULT_NOTE_TEMPLATES[len(self.templates)])
+        self.save_templates_callback = save_templates_callback
         self.title("افزودن یادداشت" if note is None else "ویرایش یادداشت")
         self.geometry("760x560")
         self.minsize(680, 480)
@@ -1596,7 +1829,7 @@ class NoteEditorDialog(tb.Toplevel):
 
         wrapper = tb.Frame(container)
         wrapper.pack(fill=BOTH, expand=True)
-        rtl_label(wrapper, "متن یادداشت", font=("Tahoma", 11, "bold")).pack(fill=X, pady=(0, 8))
+        rtl_label(wrapper, "متن یادداشت", font=(APP_FONT_FAMILY, 11, "bold")).pack(fill=X, pady=(0, 8))
 
         toolbar_primary = tb.Frame(wrapper)
         toolbar_primary.pack(fill=X, pady=(0, 6))
@@ -1615,6 +1848,14 @@ class NoteEditorDialog(tb.Toplevel):
         tb.Button(toolbar_secondary, text="شماره", bootstyle="secondary-outline", command=lambda: self.insert_prefix("1. ")).pack(side=RIGHT, padx=3)
         tb.Button(toolbar_secondary, text="جداکننده", bootstyle="warning-outline", command=lambda: self.insert_block("\n────────────────\n")).pack(side=RIGHT, padx=3)
 
+        template_row = tb.Frame(wrapper)
+        template_row.pack(fill=X, pady=(0, 8))
+        tb.Button(template_row, text="ویرایش متن‌های آماده", bootstyle="warning-outline", command=self.edit_templates).pack(side=RIGHT, padx=4)
+        tb.Button(template_row, text="درج متن آماده", bootstyle="info-outline", command=self.insert_selected_template).pack(side=RIGHT, padx=4)
+        self.template_combo = ttk.Combobox(template_row, state="readonly", justify="right", width=34)
+        self.template_combo.pack(side=RIGHT, padx=4)
+        self.refresh_template_combo()
+
         editor_box = tb.Frame(wrapper, bootstyle="light", padding=10)
         editor_box.pack(fill=BOTH, expand=True)
         scroll = tb.Scrollbar(editor_box, orient="vertical")
@@ -1623,7 +1864,7 @@ class NoteEditorDialog(tb.Toplevel):
             editor_box,
             wrap="word",
             undo=True,
-            font=("Tahoma", 10),
+            font=(APP_FONT_FAMILY, 10),
             padx=12,
             pady=10,
             spacing1=3,
@@ -1651,14 +1892,47 @@ class NoteEditorDialog(tb.Toplevel):
         self.text.focus_set()
         self.wait_window(self)
 
+    def refresh_template_combo(self):
+        labels = [shorten_text(template, limit=40) or f"متن آماده {index + 1}" for index, template in enumerate(self.templates[:5])]
+        self.template_combo.configure(values=labels)
+        if labels:
+            self.template_combo.set(labels[0])
+
+    def selected_template_text(self) -> str:
+        index = self.template_combo.current()
+        if index < 0:
+            index = 0
+        return (self.templates[index] if 0 <= index < len(self.templates) else "").strip()
+
+    def insert_selected_template(self):
+        template = self.selected_template_text()
+        if not template:
+            return
+        insertion = normalize_persian_editor_text(template)
+        current = self.text.get("1.0", "end-1c")
+        insert_at = "insert"
+        if unwrap_editor_rtl_text(current).strip():
+            insertion = f"\n{insertion}"
+        self.text.insert(insert_at, insertion)
+        self.apply_alignment()
+
+    def edit_templates(self):
+        dialog = NoteTemplateManagerDialog(self, self.templates)
+        if not dialog.result:
+            return
+        self.templates = dialog.result
+        self.refresh_template_combo()
+        if self.save_templates_callback:
+            self.save_templates_callback(self.templates)
+
     def configure_editor_widget(self, widget: tk.Text):
         widget.tag_configure("rtl", justify="right", rmargin=14, lmargin1=14, lmargin2=14, spacing1=3, spacing3=4)
-        widget.tag_configure("bold", font=("Tahoma", 10, "bold"))
-        widget.tag_configure("italic", font=("Tahoma", 10, "italic"))
+        widget.tag_configure("bold", font=(APP_FONT_FAMILY, 10, "bold"))
+        widget.tag_configure("italic", font=(APP_FONT_FAMILY, 10, "italic"))
         widget.tag_configure("underline", underline=True)
-        widget.tag_configure("heading", font=("Tahoma", 13, "bold"), spacing1=8, spacing3=6)
+        widget.tag_configure("heading", font=(APP_FONT_FAMILY, 13, "bold"), spacing1=8, spacing3=6)
         widget.tag_configure("link", foreground="#0d6efd", underline=True)
-        widget.tag_configure("timestamp", foreground="#198754", font=("Tahoma", 9, "bold"))
+        widget.tag_configure("timestamp", foreground="#198754", font=(APP_FONT_FAMILY, 9, "bold"))
         widget.tag_configure("quote", background="#f8f9fa", foreground="#495057", lmargin1=28, lmargin2=28, rmargin=18)
         widget.tag_add("rtl", "1.0", "end")
 
@@ -1673,7 +1947,7 @@ class NoteEditorDialog(tb.Toplevel):
     def on_editor_key_release(self, event=None):
         if event and event.keysym in {"Up", "Down", "Left", "Right", "Home", "End", "Prior", "Next", "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R"}:
             return
-        self.after_idle(self.normalize_editor_text)
+        self.after_idle(self.apply_alignment)
 
     def on_editor_paste(self, _event=None):
         self.after_idle(self.normalize_editor_text)
@@ -1768,14 +2042,19 @@ class NoteEditorDialog(tb.Toplevel):
         self.text.tag_add("link", start, end)
         self.apply_alignment()
 
+    def editor_wrapper_length(self) -> int:
+        raw_text = self.text.get("1.0", "end-1c")
+        return len(RTL_EDITOR_PREFIX) if raw_text.startswith(RTL_EDITOR_PREFIX) else 0
+
     def index_to_offset(self, index: str) -> int:
-        return len(self.text.get("1.0", index))
+        return len(unwrap_editor_rtl_text(self.text.get("1.0", index)))
 
     def offset_to_index(self, offset: int) -> str:
-        return f"1.0+{offset}c"
+        adjusted_offset = max(0, offset) + self.editor_wrapper_length()
+        return f"1.0+{adjusted_offset}c"
 
     def export_note_payload(self) -> dict:
-        text = self.text.get("1.0", "end-1c")
+        text = normalize_persian_editor_text(unwrap_editor_rtl_text(self.text.get("1.0", "end-1c")))
         spans = []
         for tag_name in self.RICH_TAGS:
             ranges = self.text.tag_ranges(tag_name)
@@ -1793,7 +2072,7 @@ class NoteEditorDialog(tb.Toplevel):
     def load_note_payload(self, payload: dict):
         self.text.delete("1.0", END)
         text = payload.get("text", "")
-        self.text.insert("1.0", text)
+        self.text.insert("1.0", wrap_editor_rtl_text(text))
         for span in payload.get("spans", []):
             tag_name = span.get("tag")
             if tag_name not in self.RICH_TAGS:
@@ -1809,11 +2088,11 @@ class NoteEditorDialog(tb.Toplevel):
             self.load_note_payload(payload)
         else:
             self.text.delete("1.0", END)
-            self.text.insert("1.0", normalize_persian_editor_text(value or ""))
+            self.text.insert("1.0", wrap_editor_rtl_text(normalize_persian_editor_text(value or "")))
             self.apply_alignment()
 
     def submit(self):
-        plain_text = self.text.get("1.0", END).strip()
+        plain_text = unwrap_editor_rtl_text(self.text.get("1.0", END)).strip()
         if not plain_text:
             Messagebox.show_error("متن یادداشت نمی‌تواند خالی باشد.", "یادداشت", parent=self)
             return
@@ -1837,18 +2116,27 @@ class DealDialog(tb.Toplevel):
         products: list[dict],
         existing_deals: list[dict] | None = None,
         deal: dict | None = None,
+        note_templates: list[str] | None = None,
+        save_note_templates_callback: Callable[[list[str]], None] | None = None,
+        create_customer_callback: Callable[[], dict | None] | None = None,
     ):
         super().__init__(master)
         self.result = None
         self.products = [dict(item) for item in products]
         self.customers = list(customers)
         self.customer_lookup = {item["name"]: item for item in customers}
+        self.customer_lookup_normalized = {normalize_keyboard_text((item.get("name") or "").strip()): item for item in customers if (item.get("name") or "").strip()}
         self.original_notes = deal.get("notes", "") if deal else ""
         self.original_deal_id = deal.get("id", "") if deal else ""
+        self.original_customer_id = deal.get("customer_id", "") if deal else ""
+        self.original_customer_name = deal.get("customer_name", "") if deal else ""
         self.existing_deals = [dict(item) for item in (existing_deals or [])]
+        self.note_templates = list(note_templates or DEFAULT_NOTE_TEMPLATES)
+        self.save_note_templates_callback = save_note_templates_callback
+        self.create_customer_callback = create_customer_callback
         self.notes_history_entries: list[dict[str, str]] = []
         self.title("ثبت معامله" if not deal else "ویرایش معامله")
-        self.geometry("1280x920")
+        self.geometry("1280x980" if deal else "1280x920")
         self.transient(master)
         self.grab_set()
         bind_edit_shortcuts(self)
@@ -1879,38 +2167,55 @@ class DealDialog(tb.Toplevel):
             ("operator_commission", "کمسیون اپراتور", 4, 1),
         ]
         for key, title, row, column in fields:
-            cell = tb.Frame(form_grid, padding=6)
+            cell = tb.Frame(form_grid, padding=5)
             cell.grid(row=row, column=column, sticky="ew")
-            rtl_label(cell, title).pack(fill=X, pady=(0, 4))
+            rtl_label(cell, title).pack(fill=X, pady=(0, 3))
             if key == "customer_name":
-                widget = SearchableCombobox(cell, values=self.recent_customer_values(), justify="right")
+                search_row = tb.Frame(cell)
+                search_row.pack(fill=X, pady=(0, 8))
+                widget = SearchableCombobox(search_row, values=self.recent_customer_values(), justify="right")
+                widget.pack(side=RIGHT, fill=X, expand=True)
+                tb.Button(search_row, text="تعریف مشتری", width=12, bootstyle="secondary-outline", command=self.create_customer_inline).pack(side=RIGHT, padx=(0, 6))
             elif key in combo_map:
                 widget = ttk.Combobox(cell, values=combo_map[key], justify="right", state="readonly")
+                widget.pack(fill=X, pady=(0, 8))
             elif key == "product":
                 widget = ttk.Combobox(cell, values=[], justify="right", state="readonly")
+                widget.pack(fill=X, pady=(0, 8))
             else:
                 widget = tb.Entry(cell, justify="right")
-            widget.pack(fill=X, pady=(0, 10))
+                widget.pack(fill=X, pady=(0, 8))
             self.inputs[key] = widget
-        self.inputs["customer_name"].bind("<FocusIn>", lambda _event: self.inputs["customer_name"].set_values(self.recent_customer_values()))
+            if key == "customer_name":
+                self.customer_mobile_label = rtl_label(cell, "شماره موبایل: -", bootstyle="secondary")
+                mobile_row = tb.Frame(cell)
+                mobile_row.pack(fill=X, pady=(0, 3))
+                tb.Button(mobile_row, text="کپی شماره", width=11, bootstyle="secondary-outline", command=self.copy_customer_mobile).pack(side=LEFT, padx=(6, 0))
+                self.customer_mobile_label = rtl_label(mobile_row, "شماره موبایل: -", bootstyle="secondary")
+                self.customer_mobile_label.pack(side=RIGHT, fill=X, expand=True)
+        self.inputs["customer_name"].bind("<FocusIn>", lambda _event: self.inputs["customer_name"].set_values(self.recent_customer_values()), add="+")
+        self.inputs["customer_name"].bind("<KeyRelease>", self.update_customer_mobile_label, add="+")
+        self.inputs["customer_name"].bind("<FocusOut>", self.update_customer_mobile_label, add="+")
         self.inputs["deal_type"].bind("<<ComboboxSelected>>", lambda _event: self.refresh_product_options())
         self.inputs["sale_price"].bind("<KeyRelease>", self.on_price_change)
         self.inputs["operator_commission"].bind("<KeyRelease>", self.on_price_change)
 
         bottom_grid = tb.Frame(wrapper)
-        bottom_grid.pack(fill=BOTH, expand=True, pady=(6, 0))
+        bottom_grid.pack(fill=BOTH, expand=True, pady=(4, 0))
         bottom_grid.columnconfigure(0, weight=1)
         bottom_grid.columnconfigure(1, weight=2)
+        bottom_grid.rowconfigure(0, weight=1)
+        bottom_grid.grid_anchor("n")
 
-        reminder_box = tb.Frame(bottom_grid, padding=6)
-        reminder_box.grid(row=0, column=0, sticky="nsew")
-        rtl_label(reminder_box, "تاریخ یادآور").pack(fill=X, pady=(0, 4))
+        reminder_box = tb.Frame(bottom_grid, padding=5)
+        reminder_box.grid(row=0, column=0, sticky="new")
+        rtl_label(reminder_box, "تاریخ یادآور").pack(fill=X, pady=(0, 3))
         reminder_date = JalaliDateField(reminder_box, reminder_counter=self.reminder_counts_for_month)
-        reminder_date.pack(fill=X, pady=(0, 8))
+        reminder_date.pack(fill=X, pady=(0, 6))
         self.inputs["reminder_date"] = reminder_date
 
         time_row = tb.Frame(reminder_box)
-        time_row.pack(fill=X, pady=(0, 10))
+        time_row.pack(fill=X, pady=(0, 8))
         rtl_label(time_row, "ساعت", width=10).pack(side=RIGHT)
         reminder_hour = tb.Spinbox(time_row, from_=0, to=23, width=5, justify="center")
         reminder_hour.pack(side=RIGHT, padx=6)
@@ -1921,7 +2226,7 @@ class DealDialog(tb.Toplevel):
         self.inputs["reminder_minute"] = reminder_minute
 
         messenger_box = tb.LabelFrame(reminder_box, text="ارتباط سریع")
-        messenger_box.pack(fill=X, pady=(8, 0))
+        messenger_box.pack(fill=X, pady=(6, 0))
         messenger_body = tb.Frame(messenger_box, padding=8)
         messenger_body.pack(fill=X)
         tb.Button(messenger_body, text="Telegram", bootstyle="info-outline", command=self.open_telegram).pack(side=RIGHT, padx=4, pady=2)
@@ -1931,21 +2236,20 @@ class DealDialog(tb.Toplevel):
         tb.Button(messenger_body, text="Rubika", bootstyle="danger-outline", command=self.open_rubika).pack(side=RIGHT, padx=4, pady=2)
 
         action_box = tb.LabelFrame(reminder_box, text="ثبت معامله")
-        action_box.pack(fill=X, pady=(10, 0))
-        action_body = tb.Frame(action_box, padding=10)
+        action_box.pack(fill=X, pady=(8, 0))
+        action_body = tb.Frame(action_box, padding=8)
         action_body.pack(fill=X)
         tb.Button(action_body, text="ذخیره", width=18, bootstyle="success", command=self.save).pack(fill=X, pady=(0, 8))
         tb.Button(action_body, text="انصراف", width=18, bootstyle="secondary", command=self.destroy).pack(fill=X)
 
-        notes_box = tb.Frame(bottom_grid, padding=6)
+        notes_box = tb.Frame(bottom_grid, padding=5)
         notes_box.grid(row=0, column=1, sticky="nsew")
-        rtl_label(notes_box, "یادداشت").pack(fill=X, pady=(0, 4))
         history_box = tb.LabelFrame(notes_box, text="یادداشت‌ها")
-        history_box.pack(fill=BOTH, expand=True, pady=(10, 0))
+        history_box.pack(fill=BOTH, expand=True, pady=(0, 0))
         history_body = tb.Frame(history_box, padding=8)
         history_body.pack(fill=BOTH, expand=True)
         history_toolbar = tb.Frame(history_body)
-        history_toolbar.pack(fill=X, pady=(0, 8))
+        history_toolbar.pack(fill=X, pady=(0, 6))
         tb.Button(history_toolbar, text="افزودن یادداشت", bootstyle="success", command=self.add_note).pack(side=RIGHT, padx=4)
         tb.Button(history_toolbar, text="ویرایش یادداشت", bootstyle="warning", command=self.edit_selected_note).pack(side=RIGHT, padx=4)
         tb.Button(history_toolbar, text="حذف یادداشت", bootstyle="danger", command=self.delete_selected_note).pack(side=RIGHT, padx=4)
@@ -1958,7 +2262,7 @@ class DealDialog(tb.Toplevel):
         self.notes_history_tree.bind("<<TreeviewSelect>>", self.show_history_note_preview)
         self.notes_history_tree.bind("<Double-1>", lambda _event: self.edit_selected_note())
         preview_box = tb.LabelFrame(history_body, text="نمایش کامل یادداشت انتخاب‌شده")
-        preview_box.pack(fill=BOTH, expand=True, pady=(8, 0))
+        preview_box.pack(fill=BOTH, expand=True, pady=(6, 0))
         preview_body = tb.Frame(preview_box, padding=8)
         preview_body.pack(fill=BOTH, expand=True)
         preview_scroll = tb.Scrollbar(preview_body, orient="vertical")
@@ -1967,7 +2271,7 @@ class DealDialog(tb.Toplevel):
             preview_body,
             height=8,
             wrap="word",
-            font=("Tahoma", 10),
+            font=(APP_FONT_FAMILY, 10),
             padx=10,
             pady=8,
             state="disabled",
@@ -1979,14 +2283,18 @@ class DealDialog(tb.Toplevel):
         bind_primary_action(self, self.save)
 
         if deal:
-            for key, widget in self.inputs.items():
-                if key in {"reminder_date", "reminder_hour", "reminder_minute"}:
-                    continue
-                if hasattr(widget, "set"):
-                    widget.set(deal.get(key, ""))
-                else:
-                    widget.insert(0, deal.get(key, ""))
+            self.inputs["title"].delete(0, END)
+            self.inputs["title"].insert(0, deal.get("title", ""))
+            self.inputs["customer_name"].set(deal.get("customer_name", ""))
+            self.inputs["deal_type"].set(deal.get("deal_type", ""))
             self.refresh_product_options(selected_product=deal.get("product", ""))
+            self.inputs["category"].set(deal.get("category", ""))
+            self.inputs["pipeline"].set(deal.get("pipeline", ""))
+            self.inputs["status"].set(deal.get("status", ""))
+            self.inputs["sale_price"].delete(0, END)
+            self.inputs["sale_price"].insert(0, deal.get("sale_price", ""))
+            self.inputs["operator_commission"].delete(0, END)
+            self.inputs["operator_commission"].insert(0, deal.get("operator_commission", ""))
             self.notes_history_entries = list(reversed(parse_notes_history(deal.get("notes", ""))))
             self.refresh_notes_history()
             reminder_at = deal.get("reminder_at", "")
@@ -1998,6 +2306,7 @@ class DealDialog(tb.Toplevel):
                 reminder_hour.insert(0, f"{jalali_when.hour:02d}")
                 reminder_minute.delete(0, END)
                 reminder_minute.insert(0, f"{jalali_when.minute:02d}")
+            self.update_customer_mobile_label()
         else:
             self.inputs["status"].set(DEAL_STATUSES[0])
             if categories:
@@ -2011,8 +2320,25 @@ class DealDialog(tb.Toplevel):
             reminder_hour.insert(0, "09")
             reminder_minute.insert(0, "00")
             self.refresh_notes_history()
+            self.update_customer_mobile_label()
 
         self.wait_window(self)
+
+    def create_customer_inline(self):
+        if not self.create_customer_callback:
+            return
+        customer = self.create_customer_callback()
+        if not customer:
+            return
+        customer_row = dict(customer)
+        self.customers.append(customer_row)
+        name = (customer_row.get("name") or "").strip()
+        if name:
+            self.customer_lookup[name] = customer_row
+            self.customer_lookup_normalized[normalize_keyboard_text(name)] = customer_row
+        self.inputs["customer_name"].set_values(self.recent_customer_values())
+        self.inputs["customer_name"].set(name)
+        self.update_customer_mobile_label()
 
     def save(self):
         title = self.inputs["title"].get().strip()
@@ -2086,12 +2412,12 @@ class DealDialog(tb.Toplevel):
         self.note_history_preview.delete("1.0", END)
         payload = decode_rich_note(text)
         self.note_history_preview.tag_configure("rtl", justify="right", rmargin=14, lmargin1=14, lmargin2=14, spacing1=3, spacing3=4)
-        self.note_history_preview.tag_configure("bold", font=("Tahoma", 10, "bold"))
-        self.note_history_preview.tag_configure("italic", font=("Tahoma", 10, "italic"))
+        self.note_history_preview.tag_configure("bold", font=(APP_FONT_FAMILY, 10, "bold"))
+        self.note_history_preview.tag_configure("italic", font=(APP_FONT_FAMILY, 10, "italic"))
         self.note_history_preview.tag_configure("underline", underline=True)
-        self.note_history_preview.tag_configure("heading", font=("Tahoma", 13, "bold"), spacing1=8, spacing3=6)
+        self.note_history_preview.tag_configure("heading", font=(APP_FONT_FAMILY, 13, "bold"), spacing1=8, spacing3=6)
         self.note_history_preview.tag_configure("link", foreground="#0d6efd", underline=True)
-        self.note_history_preview.tag_configure("timestamp", foreground="#198754", font=("Tahoma", 9, "bold"))
+        self.note_history_preview.tag_configure("timestamp", foreground="#198754", font=(APP_FONT_FAMILY, 9, "bold"))
         self.note_history_preview.tag_configure("quote", background="#f8f9fa", foreground="#495057", lmargin1=28, lmargin2=28, rmargin=18)
         if payload:
             content = payload.get("text", "")
@@ -2123,7 +2449,7 @@ class DealDialog(tb.Toplevel):
         return int(selected[0])
 
     def add_note(self):
-        dialog = NoteEditorDialog(self)
+        dialog = NoteEditorDialog(self, templates=self.note_templates, save_templates_callback=self.handle_note_templates_changed)
         if not dialog.result:
             return
         self.notes_history_entries.insert(0, dialog.result)
@@ -2134,7 +2460,7 @@ class DealDialog(tb.Toplevel):
         if note_index is None:
             Messagebox.show_warning("ابتدا یک یادداشت را انتخاب کنید.", "یادداشت", parent=self)
             return
-        dialog = NoteEditorDialog(self, self.notes_history_entries[note_index])
+        dialog = NoteEditorDialog(self, self.notes_history_entries[note_index], templates=self.note_templates, save_templates_callback=self.handle_note_templates_changed)
         if not dialog.result:
             return
         self.notes_history_entries[note_index] = dialog.result
@@ -2151,6 +2477,11 @@ class DealDialog(tb.Toplevel):
             return
         del self.notes_history_entries[note_index]
         self.refresh_notes_history()
+
+    def handle_note_templates_changed(self, templates: list[str]):
+        self.note_templates = list(templates)
+        if self.save_note_templates_callback:
+            self.save_note_templates_callback(self.note_templates)
 
     def reminder_counts_for_month(self, year: int, month: int) -> dict[int, int]:
         counts: dict[int, int] = defaultdict(int)
@@ -2177,9 +2508,39 @@ class DealDialog(tb.Toplevel):
             names.append(name)
         return names
 
+    def resolve_customer(self, name: str | None = None) -> dict | None:
+        raw_name = (name if name is not None else self.inputs["customer_name"].get()).strip()
+        if raw_name in self.customer_lookup:
+            return self.customer_lookup[raw_name]
+        normalized_name = normalize_keyboard_text(raw_name)
+        customer = self.customer_lookup_normalized.get(normalized_name)
+        if customer:
+            return customer
+        if self.original_customer_id and normalize_keyboard_text(raw_name) == normalize_keyboard_text(self.original_customer_name):
+            return next((item for item in self.customers if item.get("id") == self.original_customer_id), None)
+        return None
+
     def current_customer_mobile(self) -> str:
-        customer = self.customer_lookup.get(self.inputs["customer_name"].get().strip())
+        customer = self.resolve_customer()
         return customer.get("mobile", "") if customer else ""
+
+    def update_customer_mobile_label(self, _event=None):
+        mobile = self.current_customer_mobile().strip()
+        if hasattr(self, "customer_mobile_label"):
+            self.customer_mobile_label.configure(text=f"شماره موبایل: {mobile or '-'}")
+
+    def copy_customer_mobile(self):
+        mobile = self.current_customer_mobile().strip()
+        if not mobile:
+            Messagebox.show_warning("برای این مشتری شماره موبایلی پیدا نشد.", "کپی شماره", parent=self)
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(mobile)
+            self.update()
+            Messagebox.show_info("شماره مشتری کپی شد.", "کپی شماره", parent=self)
+        except Exception:
+            Messagebox.show_error("کپی شماره انجام نشد.", "کپی شماره", parent=self)
 
     def open_telegram(self):
         mobile = "".join(ch for ch in self.current_customer_mobile() if ch.isdigit() or ch == "+")
@@ -2231,8 +2592,8 @@ class DealDialog(tb.Toplevel):
 class DashboardCard(tb.Frame):
     def __init__(self, master, title: str, value: str, accent: str):
         super().__init__(master, bootstyle=accent, padding=14)
-        tb.Label(self, text=title, font=("Tahoma", 10), anchor="e").pack(fill=X)
-        self.value_label = tb.Label(self, text=value, font=("Tahoma", 20, "bold"), anchor="e")
+        tb.Label(self, text=title, font=(APP_FONT_FAMILY, 10), anchor="e").pack(fill=X)
+        self.value_label = tb.Label(self, text=value, font=(APP_FONT_FAMILY, 20, "bold"), anchor="e")
         self.value_label.pack(fill=X, pady=(8, 0))
 
     def set_value(self, value: str):
@@ -2264,7 +2625,7 @@ class TooltipWindow:
                 bd=1,
                 padx=10,
                 pady=8,
-                font=("Tahoma", 9),
+                font=(APP_FONT_FAMILY, 9),
                 wraplength=420,
             )
             self.label.pack(fill=BOTH, expand=True)
@@ -2280,14 +2641,14 @@ class TooltipWindow:
 class BarChart(tb.Frame):
     def __init__(self, master, title: str):
         super().__init__(master, padding=10)
-        rtl_label(self, title, font=("Tahoma", 11, "bold")).pack(fill=X, pady=(0, 8))
+        rtl_label(self, title, font=(APP_FONT_FAMILY, 11, "bold")).pack(fill=X, pady=(0, 8))
         self.canvas = tk.Canvas(self, height=240, highlightthickness=0, bg="#ffffff")
         self.canvas.pack(fill=BOTH, expand=True)
 
     def render(self, data: list[tuple[str, float]]):
         self.canvas.delete("all")
         if not data:
-            self.canvas.create_text(250, 120, text="داده‌ای برای نمایش وجود ندارد", fill="#6c757d", font=("Tahoma", 11))
+            self.canvas.create_text(250, 120, text="داده‌ای برای نمایش وجود ندارد", fill="#6c757d", font=(APP_FONT_FAMILY, 11))
             return
         width = max(self.canvas.winfo_width(), 500)
         height = max(self.canvas.winfo_height(), 240)
@@ -2300,37 +2661,137 @@ class BarChart(tb.Frame):
             left = x - bar_width
             top = height - 46 - bar_height
             self.canvas.create_rectangle(left, top, x, height - 46, fill=colors[index % len(colors)], outline="")
-            self.canvas.create_text((left + x) / 2, top - 12, text=f"{value:,.0f}", font=("Tahoma", 9))
-            self.canvas.create_text((left + x) / 2, height - 22, text=label, font=("Tahoma", 9))
+            self.canvas.create_text((left + x) / 2, top - 12, text=f"{value:,.0f}", font=(APP_FONT_FAMILY, 9))
+            self.canvas.create_text((left + x) / 2, height - 22, text=label, font=(APP_FONT_FAMILY, 9))
             x -= bar_width + 18
 
 
 class LineChart(tb.Frame):
     def __init__(self, master, title: str):
         super().__init__(master, padding=10)
-        rtl_label(self, title, font=("Tahoma", 11, "bold")).pack(fill=X, pady=(0, 8))
-        self.canvas = tk.Canvas(self, height=220, highlightthickness=0, bg="#ffffff")
+        rtl_label(self, title, font=(APP_FONT_FAMILY, 11, "bold")).pack(fill=X, pady=(0, 8))
+        self.canvas = tk.Canvas(self, height=340, highlightthickness=0, bg="#ffffff")
         self.canvas.pack(fill=BOTH, expand=True)
+        self.point_meta: list[dict[str, float | str]] = []
+        self.canvas.bind("<Motion>", self.on_motion)
+        self.canvas.bind("<Leave>", lambda _event: self.hide_hover())
 
     def render(self, data: list[tuple[str, float]]):
         self.canvas.delete("all")
+        self.point_meta = []
         if not data:
-            self.canvas.create_text(250, 110, text="داده‌ای برای نمایش وجود ندارد", fill="#6c757d", font=("Tahoma", 11))
+            self.canvas.create_text(250, 170, text="داده‌ای برای نمایش وجود ندارد", fill="#6c757d", font=(APP_FONT_FAMILY, 11))
             return
-        width = max(self.canvas.winfo_width(), 500)
-        height = max(self.canvas.winfo_height(), 220)
-        margin = 40
+        width = max(self.canvas.winfo_width(), 720)
+        height = max(self.canvas.winfo_height(), 340)
+        left_margin = 84
+        right_margin = 34
+        top_margin = 24
+        bottom_margin = 72
         max_value = max(value for _label, value in data) or 1
-        step = (width - 2 * margin) / max(1, len(data) - 1)
+        chart_width = max(1, width - left_margin - right_margin)
+        chart_height = max(1, height - top_margin - bottom_margin)
+        step = chart_width / max(1, len(data) - 1)
+
+        axis_y = height - bottom_margin
+        axis_x = left_margin
+        self.canvas.create_line(left_margin, axis_y, width - right_margin, axis_y, fill="#94a3b8", width=1)
+        self.canvas.create_line(axis_x, top_margin, axis_x, axis_y, fill="#94a3b8", width=1)
+
+        for tick in range(6):
+            ratio = tick / 5
+            y = axis_y - (chart_height * ratio)
+            value = max_value * ratio
+            self.canvas.create_line(left_margin, y, width - right_margin, y, fill="#edf2f7", width=1)
+            self.canvas.create_text(left_margin - 10, y, text=f"{value:,.0f}", fill="#6c757d", font=(APP_FONT_FAMILY, 8), anchor="e")
+
+        self.canvas.create_text(width / 2, height - 26, text="زمان", fill="#334155", font=(APP_FONT_FAMILY, 9, "bold"))
+        self.canvas.create_text(24, height / 2, text="فروش کل", fill="#334155", font=(APP_FONT_FAMILY, 9, "bold"), angle=90)
+
         points = []
         for index, (label, value) in enumerate(data):
-            x = margin + index * step
-            y = height - margin - ((height - 2 * margin) * (value / max_value))
+            x = width - right_margin - index * step
+            y = axis_y - (chart_height * (value / max_value))
             points.extend([x, y])
             self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#0d6efd", outline="")
-            self.canvas.create_text(x, height - 18, text=label, font=("Tahoma", 8))
+            self.canvas.create_text(x, height - 42, text=label, font=(APP_FONT_FAMILY, 8), width=max(52, step + 12))
+            self.point_meta.append({"x": x, "y": y, "label": label, "value": value})
         if len(points) >= 4:
             self.canvas.create_line(*points, fill="#0d6efd", width=3, smooth=True)
+
+    def on_motion(self, event):
+        if not self.point_meta:
+            self.hide_hover()
+            return
+        nearest = None
+        nearest_distance = 18
+        for item in self.point_meta:
+            distance = ((float(item["x"]) - event.x) ** 2 + (float(item["y"]) - event.y) ** 2) ** 0.5
+            if distance <= nearest_distance:
+                nearest = item
+                nearest_distance = distance
+        if not nearest:
+            self.hide_hover()
+            return
+        text = f"{nearest['label']}\n{float(nearest['value']):,.0f}"
+        x = min(self.canvas.winfo_width() - 90, event.x + 14)
+        y = max(16, event.y - 34)
+        self.show_hover(text, x, y)
+
+    def show_hover(self, text: str, x: int, y: int):
+        self.hide_hover()
+        text_id = self.canvas.create_text(x + 8, y + 8, text=text, anchor="nw", font=(APP_FONT_FAMILY, 9), fill="#111111", tags=("hover",))
+        bbox = self.canvas.bbox(text_id)
+        if not bbox:
+            return
+        left, top, right, bottom = bbox
+        rect = self.canvas.create_rectangle(left - 6, top - 4, right + 6, bottom + 4, fill="#fffdf5", outline="#ced4da", tags=("hover",))
+        self.canvas.tag_raise(text_id, rect)
+
+    def hide_hover(self):
+        self.canvas.delete("hover")
+
+
+class ColumnVisibilityDialog(tb.Toplevel):
+    def __init__(self, master, tree: ttk.Treeview, title: str):
+        super().__init__(master)
+        self.tree = tree
+        self.title(title)
+        self.geometry("340x420")
+        self.transient(master)
+        self.grab_set()
+        wrapper = tb.Frame(self, padding=14)
+        wrapper.pack(fill=BOTH, expand=True)
+        rtl_label(wrapper, "ستون‌های قابل نمایش را انتخاب کنید").pack(fill=X, pady=(0, 10))
+        self.vars: dict[str, tk.BooleanVar] = {}
+        current_display = list(tree["displaycolumns"])
+        if current_display == ["#all"] or current_display == ("#all",):
+            current_display = list(tree["columns"])
+        current_display_set = set(current_display)
+        list_box = tb.Frame(wrapper)
+        list_box.pack(fill=BOTH, expand=True)
+        for col in tree["columns"]:
+            label = tree.heading(col)["text"] or col
+            var = tk.BooleanVar(value=col in current_display_set)
+            self.vars[col] = var
+            tb.Checkbutton(list_box, text=label, variable=var, bootstyle="round-toggle").pack(fill=X, pady=3)
+        actions = tb.Frame(wrapper)
+        actions.pack(fill=X, pady=(12, 0))
+        tb.Button(actions, text="اعمال", bootstyle="success", command=self.apply).pack(side=RIGHT, padx=4)
+        tb.Button(actions, text="بستن", bootstyle="secondary", command=self.destroy).pack(side=RIGHT, padx=4)
+        self.wait_window(self)
+
+    def apply(self):
+        current_order = list(self.tree["displaycolumns"])
+        if current_order == ["#all"] or current_order == ("#all",):
+            current_order = list(self.tree["columns"])
+        selected = [col for col in current_order if self.vars.get(col) and self.vars[col].get()]
+        selected += [col for col in self.tree["columns"] if col not in selected and self.vars.get(col) and self.vars[col].get()]
+        if not selected:
+            Messagebox.show_warning("حداقل یک ستون باید نمایش داده شود.", "مدیریت ستون", parent=self)
+            return
+        self.tree["displaycolumns"] = tuple(selected)
+        self.destroy()
 
 
 class ColumnOrderDialog(tb.Toplevel):
@@ -2396,7 +2857,7 @@ class InAppNotification(tb.Toplevel):
         top = tb.Frame(wrapper)
         top.pack(fill=X)
         tb.Button(top, text="Ã—", width=3, bootstyle="danger-outline", command=self.destroy).pack(side=LEFT)
-        tb.Label(top, text=title, font=("Tahoma", 10, "bold"), anchor="e").pack(side=RIGHT, fill=X, expand=True)
+        tb.Label(top, text=title, font=(APP_FONT_FAMILY, 10, "bold"), anchor="e").pack(side=RIGHT, fill=X, expand=True)
         body = tb.Label(wrapper, text=message, justify="right", anchor="e", wraplength=300)
         body.pack(fill=BOTH, expand=True, pady=(8, 0))
         for widget in (wrapper, top, body):
@@ -2422,33 +2883,38 @@ class CRMApp(tb.Toplevel):
         self.window_icon = None
         self.customer_page = 1
         self.deal_page = 1
+        self.notification_page = 1
         self.list_page_size = 12
+        self.deal_column_sort_key = ""
+        self.deal_column_sort_desc = False
         self.settings_path = app_settings_path_for_profile(profile)
         self.app_settings = load_app_settings(self.settings_path)
         self.startup_enabled_var = tk.BooleanVar(value=self.app_settings.get("launch_on_startup", True))
-        self.title(f"{APP_TITLE} - {profile.title}")
+        self.show_dashboard_commission_var = tk.BooleanVar(value=self.app_settings.get("show_dashboard_commission", True))
+        self.title(f"{APP_TITLE} - {profile.title} v{APP_VERSION}")
         self.geometry("1480x1000")
         self.minsize(1200, 980)
         try:
             self.state("zoomed")
         except tk.TclError:
             self.attributes("-fullscreen", True)
-        self.option_add("*Font", "Tahoma 10")
+        configure_app_font(self)
+        self.option_add("*Font", f"{APP_FONT_FAMILY} 10")
         self.style.configure("Treeview", rowheight=28)
-        self.style.configure("Treeview", font=("Tahoma", 10))
+        self.style.configure("Treeview", font=(APP_FONT_FAMILY, 10))
         self.style.configure("TNotebook", tabposition="ne")
         self.style.configure("Treeview.Heading", anchor="e")
-        self.style.configure("Treeview.Heading", font=("Tahoma", 10, "bold"))
-        self.style.configure("TLabel", font=("Tahoma", 10))
-        self.style.configure("TLabelframe.Label", font=("Tahoma", 10, "bold"))
-        self.style.configure("TButton", font=("Tahoma", 10))
-        self.style.configure("TCheckbutton", font=("Tahoma", 10))
-        self.style.configure("TCombobox", font=("Tahoma", 10))
+        self.style.configure("Treeview.Heading", font=(APP_FONT_FAMILY, 10, "bold"))
+        self.style.configure("TLabel", font=(APP_FONT_FAMILY, 10))
+        self.style.configure("TLabelframe.Label", font=(APP_FONT_FAMILY, 10, "bold"))
+        self.style.configure("TButton", font=(APP_FONT_FAMILY, 10))
+        self.style.configure("TCheckbutton", font=(APP_FONT_FAMILY, 10))
+        self.style.configure("TCombobox", font=(APP_FONT_FAMILY, 10))
         self.configure(bg="#f7f7fb")
-        self.style.configure("Header.TLabel", font=("Tahoma", 18, "bold"), anchor="e")
-        self.style.configure("Section.TLabel", font=("Tahoma", 12, "bold"), anchor="e")
-        self.style.configure("Sidebar.TButton", font=("Tahoma", 10, "bold"), foreground="#111111", background="#ffffff")
-        self.style.configure("SidebarTitle.TLabel", font=("Tahoma", 12, "bold"), foreground="#111111", anchor="e")
+        self.style.configure("Header.TLabel", font=(APP_FONT_FAMILY, 18, "bold"), anchor="e")
+        self.style.configure("Section.TLabel", font=(APP_FONT_FAMILY, 12, "bold"), anchor="e")
+        self.style.configure("Sidebar.TButton", font=(APP_FONT_FAMILY, 10, "bold"), foreground="#111111", background="#ffffff")
+        self.style.configure("SidebarTitle.TLabel", font=(APP_FONT_FAMILY, 12, "bold"), foreground="#111111", anchor="e")
         try:
             Registry(APP_NOTIFY_ID, sys.executable, os.path.abspath(sys.argv[0]), force_override=True)
         except Exception:
@@ -2457,9 +2923,11 @@ class CRMApp(tb.Toplevel):
         bind_edit_shortcuts(self)
         set_windows_startup(self.startup_enabled_var.get())
         self.build_layout()
+        self.sync_overdue_reminders_on_startup()
         self.refresh_everything()
         self.protocol("WM_DELETE_WINDOW", self.close_app)
         self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
+        self.after(1200, self.maybe_prompt_update_check)
         self.after(self.reminder_poll_ms, self.check_reminders)
 
     def close_app(self):
@@ -2480,7 +2948,66 @@ class CRMApp(tb.Toplevel):
 
     def save_app_settings(self):
         self.app_settings["launch_on_startup"] = bool(self.startup_enabled_var.get())
+        self.app_settings["show_dashboard_commission"] = bool(self.show_dashboard_commission_var.get())
         save_app_settings(self.settings_path, self.app_settings)
+
+    def note_templates(self) -> list[str]:
+        templates = self.app_settings.get("note_templates", list(DEFAULT_NOTE_TEMPLATES))
+        if not isinstance(templates, list):
+            templates = list(DEFAULT_NOTE_TEMPLATES)
+        templates = [str(item or "").strip() for item in templates[:5]]
+        while len(templates) < 5:
+            templates.append(DEFAULT_NOTE_TEMPLATES[len(templates)])
+        return templates
+
+    def save_note_templates(self, templates: list[str]):
+        cleaned = [str(item or "").strip() for item in templates[:5]]
+        while len(cleaned) < 5:
+            cleaned.append(DEFAULT_NOTE_TEMPLATES[len(cleaned)])
+        self.app_settings["note_templates"] = cleaned
+        self.save_app_settings()
+
+    def toggle_dashboard_commission_visibility(self, visible: bool):
+        self.show_dashboard_commission_var.set(bool(visible))
+        self.save_app_settings()
+        self.refresh_dashboard()
+
+    def masked_commission_text(self, value: str) -> str:
+        return value if self.show_dashboard_commission_var.get() else "******"
+
+    def maybe_prompt_update_check(self):
+        last_prompt = (self.app_settings.get("last_update_prompt_at", "") or "").strip()
+        now = datetime.now()
+        should_prompt = True
+        if last_prompt:
+            try:
+                last_dt = datetime.strptime(last_prompt, "%Y-%m-%d")
+                should_prompt = (now - last_dt).days >= APP_UPDATE_CHECK_DAYS
+            except ValueError:
+                should_prompt = True
+        if not should_prompt:
+            return
+        self.app_settings["last_update_prompt_at"] = now.strftime("%Y-%m-%d")
+        self.save_app_settings()
+        self.show_update_check_dialog()
+
+    def show_update_check_dialog(self):
+        dialog = tb.Toplevel(self)
+        dialog.title("بررسی نسخه جدید")
+        dialog.geometry("560x220")
+        dialog.transient(self)
+        dialog.grab_set()
+        wrapper = tb.Frame(dialog, padding=18)
+        wrapper.pack(fill=BOTH, expand=True)
+        rtl_label(wrapper, "برای دریافت نسخه جدید، هر چند وقت یک‌بار صفحه گیت‌هاب پروژه را بررسی کنید.", font=(APP_FONT_FAMILY, 11, "bold")).pack(fill=X, pady=(0, 10))
+        rtl_label(wrapper, f"این یادآوری هر {APP_UPDATE_CHECK_DAYS} روز یک‌بار نمایش داده می‌شود.").pack(fill=X, pady=(0, 10))
+        link = tb.Label(wrapper, text=APP_GITHUB_URL, foreground="#0d6efd", cursor="hand2", anchor="e", justify="right")
+        link.pack(fill=X, pady=(0, 16))
+        link.bind("<Button-1>", lambda _event: webbrowser.open(APP_GITHUB_URL))
+        actions = tb.Frame(wrapper)
+        actions.pack(fill=X)
+        tb.Button(actions, text="باز کردن گیت‌هاب", bootstyle="info", command=lambda: webbrowser.open(APP_GITHUB_URL)).pack(side=RIGHT, padx=4)
+        tb.Button(actions, text="بستن", bootstyle="secondary", command=dialog.destroy).pack(side=RIGHT, padx=4)
 
     def toggle_startup_setting(self):
         enabled = bool(self.startup_enabled_var.get())
@@ -2596,8 +3123,8 @@ class CRMApp(tb.Toplevel):
         header.pack(fill=X, pady=(0, 16))
         header_right = tb.Frame(header)
         header_right.pack(side=RIGHT)
-        tb.Button(header_right, text="ارسال به Tray", bootstyle="secondary-outline", command=self.hide_to_tray).pack(side=RIGHT, padx=(0, 8))
-        tb.Label(header_right, text=APP_TITLE, style="Header.TLabel").pack(side=RIGHT, padx=(0, 12))
+        tb.Button(header_right, text="کـوچک کـردن", bootstyle="secondary-outline", command=self.hide_to_tray).pack(side=RIGHT, padx=(0, 8))
+        tb.Label(header_right, text=f"{APP_TITLE} v{APP_VERSION}", style="Header.TLabel").pack(side=RIGHT, padx=(0, 12))
         rtl_label(header_right, f"پروفایل فعال: {self.profile.title}", bootstyle="secondary").pack(side=RIGHT)
         self.notification_badge = tb.Label(header, text=rtl_text("اعلان‌های نخوانده: 0"), bootstyle="danger")
         self.notification_badge.pack(side=LEFT)
@@ -2683,9 +3210,16 @@ class CRMApp(tb.Toplevel):
         self.card_customers = DashboardCard(cards, "تعداد مشتریان", "0", "primary")
         self.card_deals = DashboardCard(cards, "تعداد معاملات", "0", "info")
         self.card_success = DashboardCard(cards, "در دست بررسی", "0", "success")
-        self.card_revenue = DashboardCard(cards, "کمیسیون ماهیانه", "0", "warning")
-        for card in [self.card_customers, self.card_deals, self.card_success, self.card_revenue]:
+        commission_box = tb.Frame(cards)
+        self.card_revenue = DashboardCard(commission_box, "کمیسیون ماهیانه", "0", "warning")
+        self.card_revenue.pack(fill=X, expand=True)
+        commission_actions = tb.Frame(commission_box)
+        commission_actions.pack(fill=X, pady=(6, 0))
+        tb.Button(commission_actions, text="پنهان", bootstyle="secondary-outline", command=lambda: self.toggle_dashboard_commission_visibility(False)).pack(side=RIGHT, padx=3)
+        tb.Button(commission_actions, text="نمایش", bootstyle="success-outline", command=lambda: self.toggle_dashboard_commission_visibility(True)).pack(side=RIGHT, padx=3)
+        for card in [self.card_customers, self.card_deals, self.card_success]:
             card.pack(side=RIGHT, fill=X, expand=True, padx=5)
+        commission_box.pack(side=RIGHT, fill=X, expand=True, padx=5)
 
         deals_box = tb.LabelFrame(self.dashboard_tab, text="معاملات قابل نمایش در داشبورد")
         deals_box.pack(fill=BOTH, expand=True)
@@ -2751,11 +3285,12 @@ class CRMApp(tb.Toplevel):
         tb.Button(toolbar, text="ثبت معامله", bootstyle="success", command=self.add_deal).pack(side=RIGHT, padx=4)
         tb.Button(toolbar, text="ویرایش معامله", bootstyle="warning", command=self.edit_deal).pack(side=RIGHT, padx=4)
         tb.Button(toolbar, text="حذف معامله", bootstyle="danger", command=self.delete_deal).pack(side=RIGHT, padx=4)
+        tb.Button(toolbar, text="مدیریت ستون", bootstyle="info-outline", command=self.manage_deal_columns).pack(side=RIGHT, padx=4)
         tb.Button(toolbar, text="چیدمان ستون‌ها", bootstyle="secondary-outline", command=lambda: ColumnOrderDialog(self, self.deal_tree, "چیدمان ستون‌های معاملات")).pack(side=RIGHT, padx=4)
         self.deal_search = tb.Entry(toolbar, justify="right")
         self.deal_search.pack(side=LEFT, padx=6)
         self.deal_search.bind("<KeyRelease>", lambda _event: self.reset_deal_page())
-        self.deal_sort = ttk.Combobox(toolbar, state="readonly", justify="right", width=16, values=["بدون سورت", "یادآور", "وضعیت", "دسته‌بندی", "محصول", "نوع معامله"])
+        self.deal_sort = ttk.Combobox(toolbar, state="readonly", justify="right", width=16, values=["بدون سورت", "یادآور", "تاریخ ایجاد", "وضعیت", "دسته‌بندی", "محصول", "نوع معامله"])
         self.deal_sort.pack(side=LEFT, padx=6)
         self.deal_sort.set("بدون سورت")
         self.deal_sort.bind("<<ComboboxSelected>>", lambda _event: self.reset_deal_page())
@@ -2778,6 +3313,19 @@ class CRMApp(tb.Toplevel):
             columns=("title", "customer", "type", "product", "category", "pipeline", "status", "price", "created", "reminder", "notes"),
             show="headings",
         )
+        self.deal_tree_heading_titles = {
+            "title": "عنوان",
+            "customer": "مشتری",
+            "type": "نوع",
+            "product": "محصول",
+            "category": "دسته‌بندی",
+            "pipeline": "کاریز",
+            "status": "وضعیت",
+            "price": "قیمت فروش",
+            "created": "تاریخ ایجاد",
+            "reminder": "یادآور",
+            "notes": "یادداشت",
+        }
         for key, title, width in [
             ("title", "عنوان", 170),
             ("customer", "مشتری", 140),
@@ -2790,9 +3338,9 @@ class CRMApp(tb.Toplevel):
             ("created", "تاریخ ایجاد", 120),
             ("reminder", "یادآور", 150),
         ]:
-            self.deal_tree.heading(key, text=f"| {title} |")
+            self.deal_tree.heading(key, text=f"| {title} |", command=lambda col=key: self.sort_deal_tree_by_column(col))
             self.deal_tree.column(key, width=width, anchor="e")
-        self.deal_tree.heading("notes", text="| یادداشت |")
+        self.deal_tree.heading("notes", text="| یادداشت |", command=lambda: self.sort_deal_tree_by_column("notes"))
         self.deal_tree.column("notes", width=240, anchor="e")
         self.deal_tree["displaycolumns"] = tuple(reversed(self.deal_tree["columns"]))
         self.deal_tree.pack(fill=BOTH, expand=True)
@@ -2811,6 +3359,7 @@ class CRMApp(tb.Toplevel):
         self.deal_page_label.pack(side=RIGHT, padx=6)
         self.deal_total_label = rtl_label(deal_pager, "تعداد کل: 0")
         self.deal_total_label.pack(side=RIGHT, padx=6)
+        self.update_deal_tree_heading_labels()
 
     def build_sales(self):
         self.sales_summary = rtl_label(self.sales_tab, "جمع فروش موفق: 0", style="Section.TLabel")
@@ -2839,17 +3388,18 @@ class CRMApp(tb.Toplevel):
         for key, title in [("daily", "روزانه"), ("monthly", "ماهانه"), ("yearly", "سالانه")]:
             frame = tb.Frame(self.sales_period_notebook, padding=8)
             self.sales_period_notebook.add(frame, text=title)
-            upper = tb.Frame(frame)
-            upper.pack(fill=BOTH, expand=True)
-            tree = ttk.Treeview(upper, columns=("period", "type", "product", "count", "revenue"), show="headings")
+            frame.columnconfigure(0, weight=1)
+            frame.rowconfigure(0, weight=4)
+            frame.rowconfigure(1, weight=2)
+            chart = LineChart(frame, f"نمودار {title}")
+            chart.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
+            tree = ttk.Treeview(frame, columns=("period", "type", "product", "count", "revenue"), show="headings", height=9)
             for col, text, width in [("period", "بازه", 120), ("type", "نوع معامله", 140), ("product", "محصول", 160), ("count", "تعداد", 90), ("revenue", "درآمد", 140)]:
                 tree.heading(col, text=text)
                 tree.column(col, width=width, anchor="e")
-            tree.pack(side=RIGHT, fill=BOTH, expand=True)
+            tree.grid(row=1, column=0, sticky="nsew")
             if not hasattr(self, "sales_charts"):
                 self.sales_charts = {}
-            chart = LineChart(upper, f"نمودار {title}")
-            chart.pack(side=RIGHT, fill=BOTH, expand=True, padx=(10, 0))
             self.sales_trees[key] = tree
             self.sales_charts[key] = chart
 
@@ -2868,27 +3418,77 @@ class CRMApp(tb.Toplevel):
 
     def build_notifications(self):
         rtl_label(self.notifications_tab, "اعلان‌ها و یادآورها", style="Section.TLabel").pack(fill=X, pady=(0, 10))
-        self.notifications_tree = ttk.Treeview(self.notifications_tab, columns=("title", "customer", "status", "reminder"), show="headings", selectmode="extended")
-        for key, title, width in [("title", "معامله", 220), ("customer", "مشتری", 150), ("status", "وضعیت", 130), ("reminder", "زمان یادآور", 180)]:
+        self.notifications_tree = ttk.Treeview(
+            self.notifications_tab,
+            columns=("type", "title", "customer", "category", "product", "notes", "reminder"),
+            show="headings",
+            selectmode="extended",
+        )
+        for key, title, width in [
+            ("type", "نوع اعلان", 110),
+            ("title", "معامله", 180),
+            ("customer", "مشتری", 150),
+            ("category", "دسته‌بندی", 130),
+            ("product", "محصول", 150),
+            ("notes", "یادداشت", 220),
+            ("reminder", "یادآور", 170),
+        ]:
             self.notifications_tree.heading(key, text=title)
             self.notifications_tree.column(key, width=width, anchor="e")
+        self.notifications_tree["displaycolumns"] = ("reminder", "notes", "product", "category", "customer", "title", "type")
         self.notifications_tree.pack(fill=BOTH, expand=True)
+        self.notifications_tree.bind("<ButtonRelease-1>", self.open_notification_deal)
         self.notifications_tree.bind("<Double-1>", self.open_notification_deal)
+        self.notifications_tree.bind("<Return>", self.open_notification_deal)
         toolbar = tb.Frame(self.notifications_tab)
         toolbar.pack(fill=X, pady=(10, 0))
         tb.Button(toolbar, text="خوانده شد", bootstyle="success-outline", command=self.mark_selected_notifications_read).pack(side=RIGHT, padx=4)
         tb.Button(toolbar, text="همگی خوانده شد", bootstyle="secondary-outline", command=self.mark_all_notifications_read).pack(side=RIGHT, padx=4)
+        self.notification_date_filter = JalaliDateField(toolbar, allow_empty=True, on_change=self.reset_notification_page)
+        self.notification_date_filter.pack(side=RIGHT, padx=6)
         self.notification_sort = ttk.Combobox(toolbar, state="readonly", justify="right", width=16, values=["جدیدترین", "قدیمی‌ترین", "وضعیت", "عنوان"])
         self.notification_sort.pack(side=RIGHT, padx=6)
         self.notification_sort.set("جدیدترین")
-        self.notification_sort.bind("<<ComboboxSelected>>", lambda _event: self.refresh_notifications())
+        self.notification_sort.bind("<<ComboboxSelected>>", lambda _event: self.reset_notification_page())
+        notification_pager = tb.Frame(self.notifications_tab)
+        notification_pager.pack(fill=X, pady=(8, 0))
+        tb.Button(notification_pager, text="بعدی", bootstyle="secondary-outline", command=lambda: self.change_notification_page(1)).pack(side=LEFT, padx=4)
+        tb.Button(notification_pager, text="قبلی", bootstyle="secondary-outline", command=lambda: self.change_notification_page(-1)).pack(side=LEFT, padx=4)
+        tb.Button(notification_pager, text="تایید", bootstyle="info-outline", command=self.go_notification_page).pack(side=LEFT, padx=4)
+        self.notification_page_entry = tb.Entry(notification_pager, width=6, justify="center")
+        self.notification_page_entry.pack(side=LEFT, padx=4)
+        self.notification_page_label = rtl_label(notification_pager, "صفحه 1 از 1")
+        self.notification_page_label.pack(side=RIGHT, padx=6)
+        self.notification_total_label = rtl_label(notification_pager, "تعداد کل: 0")
+        self.notification_total_label.pack(side=RIGHT, padx=6)
 
     def build_io(self):
-        rtl_label(self.io_tab, "ورودی/خروجی اکسل", style="Section.TLabel").pack(fill=X, pady=(0, 10))
-        subtitle = rtl_label(self.io_tab, "برای هر بخش می‌توانید فایل اکسل وارد یا صادر کنید. ستون شناسه لازم نیست و خود برنامه آن را مدیریت می‌کند.", bootstyle="secondary")
+        outer = tb.Frame(self.io_tab)
+        outer.pack(fill=BOTH, expand=True)
+        scrollbar = tb.Scrollbar(outer, orient="vertical")
+        scrollbar.pack(side=LEFT, fill=Y)
+        canvas = tk.Canvas(outer, highlightthickness=0, yscrollcommand=scrollbar.set, bg="#f7f7fb")
+        canvas.pack(side=RIGHT, fill=BOTH, expand=True)
+        scrollbar.configure(command=canvas.yview)
+        content = tb.Frame(canvas)
+        content_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def sync_io_scrollregion(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfigure(content_id, width=canvas.winfo_width())
+
+        content.bind("<Configure>", sync_io_scrollregion)
+        canvas.bind("<Configure>", sync_io_scrollregion)
+        canvas.bind_all("<MouseWheel>", lambda event: canvas.yview_scroll(int(-1 * (event.delta / 120)), "units"), add="+")
+
+        rtl_label(content, "ورودی/خروجی اکسل", style="Section.TLabel").pack(fill=X, pady=(0, 10))
+        subtitle = rtl_label(content, "برای هر بخش می‌توانید فایل اکسل وارد یا صادر کنید. ستون شناسه لازم نیست و خود برنامه آن را مدیریت می‌کند.", bootstyle="secondary")
         subtitle.pack(fill=X, pady=(0, 12))
+        reset_row = tb.Frame(content)
+        reset_row.pack(fill=X, pady=(0, 10))
+        tb.Button(reset_row, text="ریست کامل", bootstyle="danger", command=self.reset_all_data).pack(side=RIGHT)
         for title in DATASET_CONFIG:
-            box = tb.LabelFrame(self.io_tab, text=title)
+            box = tb.LabelFrame(content, text=title)
             box.pack(fill=X, pady=6)
             row = tb.Frame(box, padding=10)
             row.pack(fill=X, pady=6)
@@ -2900,12 +3500,12 @@ class CRMApp(tb.Toplevel):
 
         hero = tb.Frame(self.guide_tab, padding=20, bootstyle="info")
         hero.pack(fill=X, pady=(0, 14))
-        rtl_label(hero, "راهنمای شروع سریع و استفاده حرفه‌ای", font=("Tahoma", 14, "bold"), foreground="#0f172a").pack(fill=X, pady=(0, 8))
+        rtl_label(hero, "راهنمای شروع سریع و استفاده حرفه‌ای", font=(APP_FONT_FAMILY, 14, "bold"), foreground="#0f172a").pack(fill=X, pady=(0, 8))
         rtl_label(
             hero,
             "این بخش برای این طراحی شده که بدون آزمون و خطا، مسیر استفاده از نرم‌افزار را سریع پیدا کنید. همه داده‌ها آفلاین ذخیره می‌شوند و هر کاربر ویندوز می‌تواند پروفایل، مشتریان، معاملات، اعلان‌ها و گزارش‌های مخصوص خودش را داشته باشد.",
             wraplength=1080,
-            font=("Tahoma", 10),
+            font=(APP_FONT_FAMILY, 10),
             foreground="#0f172a",
         ).pack(fill=X)
 
@@ -2920,8 +3520,8 @@ class CRMApp(tb.Toplevel):
         for index, (title, text) in enumerate(quick_cards):
             card = tb.Frame(quick_row, padding=14, bootstyle="light")
             card.grid(row=0, column=index, sticky="nsew", padx=6)
-            rtl_label(card, title, font=("Tahoma", 11, "bold")).pack(fill=X, pady=(0, 6))
-            rtl_label(card, text, wraplength=300, font=("Tahoma", 9)).pack(fill=X)
+            rtl_label(card, title, font=(APP_FONT_FAMILY, 11, "bold")).pack(fill=X, pady=(0, 6))
+            rtl_label(card, text, wraplength=300, font=(APP_FONT_FAMILY, 9)).pack(fill=X)
 
         sections = [
             ("شروع کار", "برای استفاده از نرم‌افزار، ابتدا یک پروفایل بسازید و با نام کاربری و رمز عبور وارد شوید. بعد از ورود، بهتر است از بخش تنظیمات، دسته‌بندی‌ها، کاریزها، نوع معامله و محصولات را متناسب با روش فروش خودتان تعریف کنید تا ثبت اطلاعات سریع‌تر و دقیق‌تر انجام شود."),
@@ -2941,20 +3541,20 @@ class CRMApp(tb.Toplevel):
             section_box.grid(row=index // 2, column=index % 2, sticky="nsew", padx=6, pady=6)
             header = tb.Frame(section_box, bootstyle="secondary")
             header.pack(fill=X, pady=(0, 10))
-            rtl_label(header, heading, font=("Tahoma", 11, "bold"), foreground="#111111").pack(fill=X, padx=10, pady=8)
-            rtl_label(section_box, paragraph, wraplength=500, font=("Tahoma", 10)).pack(fill=X)
+            rtl_label(header, heading, font=(APP_FONT_FAMILY, 11, "bold"), foreground="#111111").pack(fill=X, padx=10, pady=8)
+            rtl_label(section_box, paragraph, wraplength=500, font=(APP_FONT_FAMILY, 10)).pack(fill=X)
 
     def build_about(self):
         rtl_label(self.about_tab, "درباره ما", style="Section.TLabel").pack(fill=X, pady=(0, 10))
 
         intro = tb.Frame(self.about_tab, padding=20, bootstyle="primary")
         intro.pack(fill=X, pady=(0, 14))
-        rtl_label(intro, "POWEREN", font=("Tahoma", 15, "bold"), foreground="#ffffff").pack(fill=X, pady=(0, 6))
+        rtl_label(intro, "POWEREN", font=(APP_FONT_FAMILY, 15, "bold"), foreground="#ffffff").pack(fill=X, pady=(0, 6))
         rtl_label(
             intro,
             f"این نرم‌افزار به‌صورت آفلاین برای مدیریت حرفه‌ای مشتریان و معاملات ساخته شده و نسخه فعلی آن {APP_VERSION} است و به‌صورت رایگان در اختیار کاربران قرار گرفته است.",
             wraplength=1080,
-            font=("Tahoma", 10),
+            font=(APP_FONT_FAMILY, 10),
             foreground="#ffffff",
         ).pack(fill=X)
 
@@ -2964,34 +3564,68 @@ class CRMApp(tb.Toplevel):
 
         creator = tb.Frame(content, padding=16, bootstyle="light")
         creator.grid(row=0, column=1, sticky="nsew", padx=6, pady=6)
-        rtl_label(creator, "مشخصات سازنده", font=("Tahoma", 11, "bold")).pack(fill=X, pady=(0, 8))
-        rtl_label(creator, "نام برند: پاوران").pack(fill=X, pady=2)
-        rtl_label(creator, "نام لاتین برند: POWEREN").pack(fill=X, pady=2)
-        rtl_label(creator, "ایمیل سازنده: siahtirim@gmail.com").pack(fill=X, pady=2)
-        rtl_label(creator, "وب‌سایت رسمی: www.poweren.ir").pack(fill=X, pady=2)
+        rtl_label(creator, "مشخصات سازنده", font=(APP_FONT_FAMILY, 11, "bold")).pack(fill=X, pady=(0, 10))
+        for line in [
+            "سازنده: محمد سیاه‌تیری",
+            "Web: Siahtiri.ir",
+            f"Email: {APP_SUPPORT_EMAIL}",
+            
+        ]:
+            row = tb.Frame(creator, bootstyle="light")
+            row.pack(fill=X, pady=3)
+            rtl_label(row, line).pack(fill=X, padx=2)
 
         links = tb.Frame(content, padding=16, bootstyle="light")
         links.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-        rtl_label(links, "لینک‌های ارتباطی و دریافت نسخه جدید", font=("Tahoma", 11, "bold")).pack(fill=X, pady=(0, 8))
+        rtl_label(links, "لینک‌های ارتباطی و دریافت نسخه جدید", font=(APP_FONT_FAMILY, 11, "bold")).pack(fill=X, pady=(0, 8))
         rtl_label(links, "برای دریافت نسخه‌های جدید، مشاهده تغییرات و ارتباط با سازنده از لینک‌های زیر استفاده کنید.").pack(fill=X, pady=(0, 10))
 
-        rtl_label(links, "وب‌سایت", font=("Tahoma", 10, "bold")).pack(fill=X)
-        site = tb.Label(links, text="https://www.poweren.ir", foreground="#0d6efd", cursor="hand2", anchor="e", justify="right")
-        site.pack(fill=X, pady=(2, 10))
-        site.bind("<Button-1>", lambda _event: webbrowser.open("https://www.poweren.ir"))
+        self.build_about_link_row(links, "وب‌سایت", APP_WEBSITE_URL, APP_WEBSITE_URL)
+        self.build_about_link_row(links, "گیت‌هاب - دریافت آپدیت جدید", APP_GITHUB_URL, APP_GITHUB_URL)
+        self.build_about_link_row(links, "ایمیل", f"mailto:{APP_SUPPORT_EMAIL}", f"mailto:{APP_SUPPORT_EMAIL}")
 
-        rtl_label(links, "گیت‌هاب - دریافت آپدیت جدید", font=("Tahoma", 10, "bold")).pack(fill=X)
-        github = tb.Label(links, text="https://github.com/siahtirilab/Offline-CRM", foreground="#0d6efd", cursor="hand2", anchor="e", justify="right")
-        github.pack(fill=X, pady=(2, 10))
-        github.bind("<Button-1>", lambda _event: webbrowser.open("https://github.com/siahtirilab/Offline-CRM"))
-
-        rtl_label(links, "ایمیل", font=("Tahoma", 10, "bold")).pack(fill=X)
-        email = tb.Label(links, text="mailto:siahtirim@gmail.com", foreground="#0d6efd", cursor="hand2", anchor="e", justify="right")
-        email.pack(fill=X)
-        email.bind("<Button-1>", lambda _event: webbrowser.open("mailto:siahtirim@gmail.com"))
+    def build_about_link_row(self, parent, title: str, display_text: str, target_url: str):
+        box = tb.Frame(parent, bootstyle="light")
+        box.pack(fill=X, pady=4)
+        rtl_label(box, title, font=(APP_FONT_FAMILY, 10, "bold")).pack(fill=X, pady=(0, 2))
+        link = tb.Label(box, text=display_text, foreground="#0d6efd", cursor="hand2", anchor="e", justify="right")
+        link.pack(fill=X)
+        link.bind("<Button-1>", lambda _event, url=target_url: webbrowser.open(url))
 
     def build_settings(self):
-        options_box = tb.LabelFrame(self.settings_tab, text="تنظیمات عمومی")
+        outer = tb.Frame(self.settings_tab)
+        outer.pack(fill=BOTH, expand=True)
+        scrollbar = tb.Scrollbar(outer, orient="vertical")
+        scrollbar.pack(side=LEFT, fill=Y)
+        canvas = tk.Canvas(outer, highlightthickness=0, bg="#f7f7fb", yscrollcommand=scrollbar.set)
+        canvas.pack(side=RIGHT, fill=BOTH, expand=True)
+        scrollbar.configure(command=canvas.yview)
+
+        body = tb.Frame(canvas, padding=2)
+        canvas_window = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def update_settings_scrollregion(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def resize_settings_body(_event):
+            canvas.itemconfigure(canvas_window, width=_event.width)
+
+        def settings_mousewheel(event):
+            if not self.settings_tab.winfo_ismapped():
+                return
+            delta = event.delta
+            if delta == 0 and getattr(event, "num", None) in (4, 5):
+                delta = 120 if event.num == 4 else -120
+            if delta:
+                canvas.yview_scroll(int(-delta / 120), "units")
+
+        body.bind("<Configure>", update_settings_scrollregion)
+        canvas.bind("<Configure>", resize_settings_body)
+        canvas.bind_all("<MouseWheel>", settings_mousewheel)
+        canvas.bind_all("<Button-4>", settings_mousewheel)
+        canvas.bind_all("<Button-5>", settings_mousewheel)
+
+        options_box = tb.LabelFrame(body, text="تنظیمات عمومی")
         options_box.pack(fill=X, pady=(0, 12))
         options_row = tb.Frame(options_box, padding=12)
         options_row.pack(fill=X)
@@ -3002,13 +3636,13 @@ class CRMApp(tb.Toplevel):
             bootstyle="success-round-toggle",
             command=self.toggle_startup_setting,
         ).pack(side=RIGHT)
-        wrapper = tb.Frame(self.settings_tab)
+        wrapper = tb.Frame(body)
         wrapper.pack(fill=BOTH, expand=True)
         self.category_manager = CategoryManager(wrapper, self.store.categories(), self.save_categories)
         self.category_manager.pack(side=RIGHT, fill=BOTH, expand=True, padx=6)
         self.pipeline_manager = TextListManager(wrapper, "کاریزها", self.store.pipelines(), self.save_pipelines)
         self.pipeline_manager.pack(side=RIGHT, fill=BOTH, expand=True, padx=6)
-        bottom = tb.Frame(self.settings_tab)
+        bottom = tb.Frame(body)
         bottom.pack(fill=BOTH, expand=True, pady=(12, 0))
         self.deal_type_manager = TextListManager(bottom, "نوع معامله", self.store.deal_types(), self.save_deal_types)
         self.deal_type_manager.pack(side=RIGHT, fill=BOTH, expand=True, padx=6)
@@ -3074,7 +3708,7 @@ class CRMApp(tb.Toplevel):
         query = self.customer_search.get().strip() if hasattr(self, "customer_search") else ""
         rows = []
         for customer in self._customers:
-            if not matches_search(query, customer["name"], customer["mobile"]):
+            if not matches_search(query, customer["name"], customer["mobile"], customer.get("mobile2", "")):
                 continue
             rows.append(customer)
         sort_key = self.customer_sort.get() if hasattr(self, "customer_sort") else "بدون سورت"
@@ -3110,6 +3744,7 @@ class CRMApp(tb.Toplevel):
             if not matches_search(search, deal["title"], deal["customer_name"], deal.get("product", ""), deal.get("notes", "")):
                 continue
             rows.append(deal)
+        rows = self.apply_deal_tree_column_sort(rows)
         page_rows, total_pages = self.paginate_rows(rows, self.deal_page, self.current_page_size(self.deal_tree))
         self.deal_page = min(max(1, self.deal_page), total_pages)
         if hasattr(self, "deal_page_label"):
@@ -3149,6 +3784,45 @@ class CRMApp(tb.Toplevel):
                 values=(deal["title"], deal["customer_name"], status_label, category_label, (deal.get("created_at", "").split(" ")[0]), deal["reminder_at"]),
                 tags=(category_tag,),
             )
+
+    def sort_deal_tree_by_column(self, column_key: str):
+        if self.deal_column_sort_key == column_key:
+            self.deal_column_sort_desc = not self.deal_column_sort_desc
+        else:
+            self.deal_column_sort_key = column_key
+            self.deal_column_sort_desc = False
+        self.deal_page = 1
+        self.update_deal_tree_heading_labels()
+        self.refresh_deal_tree()
+
+    def update_deal_tree_heading_labels(self):
+        titles = getattr(self, "deal_tree_heading_titles", {})
+        for key, title in titles.items():
+            suffix = ""
+            if key == self.deal_column_sort_key:
+                suffix = " ▼" if self.deal_column_sort_desc else " ▲"
+            self.deal_tree.heading(key, text=f"| {title}{suffix} |", command=lambda col=key: self.sort_deal_tree_by_column(col))
+
+    def apply_deal_tree_column_sort(self, rows: list[dict]) -> list[dict]:
+        if not self.deal_column_sort_key:
+            return rows
+        key_map = {
+            "title": lambda item: item.get("title", ""),
+            "customer": lambda item: item.get("customer_name", ""),
+            "type": lambda item: item.get("deal_type", ""),
+            "product": lambda item: item.get("product", ""),
+            "category": lambda item: item.get("category", ""),
+            "pipeline": lambda item: item.get("pipeline", ""),
+            "status": lambda item: item.get("status", ""),
+            "price": lambda item: to_float(item.get("sale_price", "")),
+            "created": lambda item: parse_jalali_datetime(item.get("created_at", "")) or datetime.min,
+            "reminder": lambda item: parse_jalali_datetime(item.get("reminder_at", "")) or datetime.min,
+            "notes": lambda item: note_preview_text(item.get("notes", "")),
+        }
+        sorter = key_map.get(self.deal_column_sort_key)
+        if not sorter:
+            return rows
+        return sorted(rows, key=sorter, reverse=self.deal_column_sort_desc)
 
     def deal_tree_column_name(self, column_id: str) -> str:
         if not column_id.startswith("#"):
@@ -3221,18 +3895,25 @@ class CRMApp(tb.Toplevel):
             deals = [deal for deal in deals if deal["deal_type"] == type_filter]
         reminder_day = self.deal_reminder_filter.get().strip() if hasattr(self, "deal_reminder_filter") else ""
         if reminder_day:
-            deals = [deal for deal in deals if normalize_jalali_date((deal.get("reminder_at", "").split(" ") or [""])[0]) == reminder_day]
+            deals = [
+                deal
+                for deal in deals
+                if (
+                    reminder_date := normalize_jalali_date((deal.get("reminder_at", "").split(" ") or [""])[0])
+                ) and reminder_date <= reminder_day
+            ]
         return self.sort_deals(deals, self.deal_sort.get())
 
     def sort_deals(self, deals: list[dict], sort_key: str) -> list[dict]:
         key_map = {
             "یادآور": lambda item: parse_jalali_datetime(item.get("reminder_at", "")) or datetime.max,
+            "تاریخ ایجاد": lambda item: parse_jalali_datetime(item.get("created_at", "")) or datetime.max,
             "وضعیت": lambda item: item.get("status", ""),
             "دسته‌بندی": lambda item: item.get("category", ""),
             "محصول": lambda item: item.get("product", ""),
             "نوع معامله": lambda item: item.get("deal_type", ""),
         }
-        if sort_key == "یادآور":
+        if sort_key in {"یادآور", "تاریخ ایجاد"}:
             return sorted(deals, key=key_map[sort_key], reverse=True)
         if sort_key in key_map:
             return sorted(deals, key=key_map[sort_key])
@@ -3268,6 +3949,17 @@ class CRMApp(tb.Toplevel):
             self.deal_page = 1
         self.refresh_deal_tree()
 
+    def change_notification_page(self, step: int):
+        self.notification_page = max(1, self.notification_page + step)
+        self.refresh_notifications()
+
+    def go_notification_page(self):
+        try:
+            self.notification_page = max(1, int(self.notification_page_entry.get().strip() or "1"))
+        except ValueError:
+            self.notification_page = 1
+        self.refresh_notifications()
+
     def reset_customer_page(self):
         self.customer_page = 1
         self.refresh_customer_tree()
@@ -3275,6 +3967,13 @@ class CRMApp(tb.Toplevel):
     def reset_deal_page(self):
         self.deal_page = 1
         self.refresh_deal_tree()
+
+    def reset_notification_page(self):
+        self.notification_page = 1
+        self.refresh_notifications()
+
+    def manage_deal_columns(self):
+        ColumnVisibilityDialog(self, self.deal_tree, "مدیریت ستون‌های معاملات")
 
     def mark_selected_notifications_read(self):
         selected = list(self.notifications_tree.selection())
@@ -3284,11 +3983,7 @@ class CRMApp(tb.Toplevel):
         self._mark_notification_ids_as_read(selected)
 
     def mark_all_notifications_read(self):
-        unread = []
-        for item_id in self.notifications_tree.get_children():
-            tags = self.notifications_tree.item(item_id, "tags")
-            if "unread" in tags:
-                unread.append(item_id)
+        unread = [row["iid"] for row in getattr(self, "_notification_rows_cache", []) if not row.get("read", False)]
         if not unread:
             Messagebox.show_info("اعلان خوانده‌نشده‌ای وجود ندارد.", "اعلان‌ها", parent=self)
             return
@@ -3344,13 +4039,13 @@ class CRMApp(tb.Toplevel):
         current_month = jdatetime.datetime.now().strftime("%Y/%m")
         monthly_commission = 0.0
         for deal in success_deals:
-            created = deal.get("created_at", "")
-            if created.startswith(current_month):
+            success_time = deal.get("updated_at", "") or deal.get("created_at", "")
+            if success_time.startswith(current_month):
                 monthly_commission += to_float(deal.get("operator_commission", ""))
         self.card_customers.set_value(str(len(self._customers)))
         self.card_deals.set_value(str(len(deals)))
         self.card_success.set_value(str(len(in_review_deals)))
-        self.card_revenue.set_value(f"{monthly_commission:,.0f}")
+        self.card_revenue.set_value(self.masked_commission_text(f"{monthly_commission:,.0f}"))
 
         for item in self.dashboard_deal_tree.get_children():
             self.dashboard_deal_tree.delete(item)
@@ -3418,6 +4113,7 @@ class CRMApp(tb.Toplevel):
         self.sales_success_rate.set_value(f"{success_rate:.1f}%")
         self.sales_status_mix.set_value(f"م:{status_count['موفق']} ن:{status_count['ناموفق']} ب:{status_count['در دست بررسی']}")
         aggregations = {"daily": defaultdict(lambda: {"count": 0, "revenue": 0.0}), "monthly": defaultdict(lambda: {"count": 0, "revenue": 0.0}), "yearly": defaultdict(lambda: {"count": 0, "revenue": 0.0})}
+        chart_totals = {"daily": defaultdict(float), "monthly": defaultdict(float), "yearly": defaultdict(float)}
         for deal in success_deals:
             dt = parse_jalali_datetime(deal.get("updated_at", "") or deal.get("created_at", ""))
             jalali_dt = jdatetime.datetime.fromgregorian(datetime=dt) if dt else jdatetime.datetime.now()
@@ -3430,19 +4126,20 @@ class CRMApp(tb.Toplevel):
                 bucket = aggregations[period_key][(label, deal["deal_type"] or "نامشخص", deal.get("product", "") or "بدون محصول")]
                 bucket["count"] += 1
                 bucket["revenue"] += to_float(deal["sale_price"])
+                chart_totals[period_key][label] += to_float(deal["sale_price"])
         for period_key, tree in self.sales_trees.items():
             for item in tree.get_children():
                 tree.delete(item)
-            rows = sorted(aggregations[period_key].items(), key=lambda item: item[1]["revenue"], reverse=True)
+            rows = sorted(aggregations[period_key].items(), key=lambda item: (item[0][0], item[0][1], item[0][2]))
             for (period, deal_type, product), metrics in rows:
                 tree.insert("", END, values=(period, deal_type, product, int(metrics["count"]), f"{metrics['revenue']:,.0f}"))
-            self.sales_charts[period_key].render([(f"{period}\n{product}", metrics["revenue"]) for (period, _deal_type, product), metrics in rows[:7]])
+            chart_rows = sorted(chart_totals[period_key].items(), key=lambda item: item[0], reverse=True)
+            self.sales_charts[period_key].render(chart_rows)
 
     def refresh_notifications(self):
         for item in self.notifications_tree.get_children():
             self.notifications_tree.delete(item)
         now = datetime.now()
-        due_count = 0
         rows = []
         for deal in sorted(self._deals, key=lambda item: item.get("reminder_at", "")):
             due = parse_jalali_datetime(deal.get("reminder_at", ""))
@@ -3450,12 +4147,14 @@ class CRMApp(tb.Toplevel):
                 continue
             if deal.get("last_notified_at", "") != deal.get("reminder_at", ""):
                 continue
-            if due <= now:
-                due_count += 1
             rows.append({
                 "iid": f"deal:{deal['id']}",
+                "type": "معامله",
                 "title": deal["title"],
                 "customer": deal["customer_name"],
+                "category": category_display(deal.get("category", "")),
+                "product": deal.get("product", ""),
+                "notes": note_preview_text(deal.get("notes", ""), limit=80) or "-",
                 "status": deal["status"],
                 "reminder": deal["reminder_at"],
                 "read": deal.get("notification_seen_at", "") == deal.get("reminder_at", ""),
@@ -3473,12 +4172,23 @@ class CRMApp(tb.Toplevel):
             if birth.month == jalali_today.month and birth.day == jalali_today.day and customer.get("birthday_notified_for", "") == today_key:
                 rows.append({
                     "iid": f"birthday:{customer['id']}",
+                    "type": "تولد",
                     "title": "تولد مشتری",
                     "customer": customer["name"],
+                    "category": "",
+                    "product": "",
+                    "notes": "-",
                     "status": "تولد",
                     "reminder": f"{today_key} 10:00",
                     "read": customer.get("birthday_seen_for", "") == today_key,
                 })
+        notification_day = self.notification_date_filter.get().strip() if hasattr(self, "notification_date_filter") else ""
+        if notification_day:
+            rows = [
+                row
+                for row in rows
+                if normalize_jalali_date((row.get("reminder", "").split(" ") or [""])[0]) == notification_day
+            ]
         sort_key = self.notification_sort.get() if hasattr(self, "notification_sort") else "جدیدترین"
         key_map = {
             "یادآور": lambda item: parse_jalali_datetime(item["reminder"]) or datetime.max,
@@ -3491,14 +4201,31 @@ class CRMApp(tb.Toplevel):
             rows = sorted(rows, key=lambda item: parse_jalali_datetime(item["reminder"]) or datetime.max)
         elif sort_key in key_map:
             rows = sorted(rows, key=key_map[sort_key])
+        self._notification_rows_cache = rows
+        page_rows, total_pages = self.paginate_rows(rows, self.notification_page, self.current_page_size(self.notifications_tree))
+        self.notification_page = min(max(1, self.notification_page), total_pages)
+        if hasattr(self, "notification_page_label"):
+            self.notification_page_label.configure(text=f"صفحه {self.notification_page} از {total_pages}")
+        if hasattr(self, "notification_total_label"):
+            self.notification_total_label.configure(text=f"تعداد کل: {len(rows)}")
+        if hasattr(self, "notification_page_entry"):
+            self.notification_page_entry.delete(0, END)
+            self.notification_page_entry.insert(0, str(self.notification_page))
         unread_count = 0
         for row in rows:
             if not row["read"]:
                 unread_count += 1
+        self.notifications_tree.tag_configure("read", background="#eef2f3")
+        self.notifications_tree.tag_configure("unread", background="#fff4d6")
+        for row in page_rows:
             tag = "read" if row["read"] else "unread"
-            self.notifications_tree.tag_configure("read", background="#eef2f3")
-            self.notifications_tree.tag_configure("unread", background="#fff4d6")
-            self.notifications_tree.insert("", END, iid=row["iid"], values=(row["title"], row["customer"], row["status"], row["reminder"]), tags=(tag,))
+            self.notifications_tree.insert(
+                "",
+                END,
+                iid=row["iid"],
+                values=(row["type"], row["title"], row["customer"], row["category"], row["product"], row["notes"], row["reminder"]),
+                tags=(tag,),
+            )
         self.notification_badge.configure(text=rtl_text(f"اعلان‌های نخوانده: {unread_count}"))
 
     def save_categories(self, rows: list[dict]):
@@ -3520,27 +4247,60 @@ class CRMApp(tb.Toplevel):
         self.store.save_products(rows)
         self.refresh_everything()
 
+    def all_customer_phones(self) -> list[str]:
+        values = []
+        seen = set()
+        for row in self.store.customers():
+            for key in ("mobile", "mobile2"):
+                phone = (row.get(key) or "").strip()
+                if phone and phone not in seen:
+                    seen.add(phone)
+                    values.append(phone)
+        return values
+
+    def reset_all_data(self):
+        first_confirm = Messagebox.okcancel("این کار تمام داده‌های واردشده را پاک می‌کند. ادامه می‌دهید؟", "ریست کامل", parent=self)
+        if first_confirm != "OK":
+            return
+        second_confirm = Messagebox.okcancel("اخطار نهایی: با ریست کامل، همه مشتریان، معاملات و تنظیمات فروش پاک می‌شوند. مطمئن هستید؟", "ریست کامل", parent=self)
+        if second_confirm != "OK":
+            return
+        self.store.reset_all_data()
+        self.app_settings["note_templates"] = list(DEFAULT_NOTE_TEMPLATES)
+        self.save_app_settings()
+        self.refresh_everything()
+        Messagebox.show_info("همه داده‌های واردشده پاک شدند و نرم‌افزار به حالت اولیه برگشت.", "ریست کامل", parent=self)
+
     def export_dataset(self, title: str):
         filename, fields = DATASET_CONFIG[title]
         export_fields = [field for field in fields if field != "id"]
         path = filedialog.asksaveasfilename(parent=self, defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")], initialfile=filename.replace(".csv", ".xlsx"))
         if not path:
             return
-        if title == "مشتریان":
+        if title == "گزارش درآمدی":
+            headers = ["اسم اپراتور", "زمان ثبت موفق", "نوع معامله", "محصول", "قیمت فروش", "کمسیون اپراتور"]
+            rows = self.income_report_rows()
+        elif title == "مشتریان":
             rows = self.store.customers()
+            headers = export_fields
         elif title == "معاملات":
             rows = self.store.deals()
+            headers = export_fields
         elif title == "کاریزها":
             rows = self.store.pipelines()
+            headers = export_fields
         elif title == "دسته‌بندی‌های معامله":
             rows = self.store.categories()
+            headers = export_fields
         elif title == "نوع معامله":
             rows = self.store.deal_types()
+            headers = export_fields
         else:
             rows = self.store.products()
+            headers = export_fields
         wb = Workbook()
         ws = wb.active
-        ws.append(export_fields)
+        ws.append(headers)
         for row in rows:
             ws.append([row.get(field, "") for field in export_fields])
         wb.save(path)
@@ -3548,6 +4308,9 @@ class CRMApp(tb.Toplevel):
 
     def import_dataset(self, title: str):
         filename, fields = DATASET_CONFIG[title]
+        if title == "گزارش درآمدی":
+            Messagebox.show_warning("گزارش درآمدی فقط برای اکسپورت است و امکان ایمپورت ندارد.", "ایمپورت", parent=self)
+            return
         path = filedialog.askopenfilename(parent=self, filetypes=[("Excel", "*.xlsx")])
         if not path:
             return
@@ -3581,6 +4344,26 @@ class CRMApp(tb.Toplevel):
         self.refresh_everything()
         Messagebox.show_info("ورود اطلاعات از اکسل انجام شد.", "ایمپورت", parent=self)
 
+    def income_report_rows(self) -> list[dict]:
+        rows = []
+        success_deals = [deal for deal in self.store.deals() if deal.get("status", "") == "موفق"]
+        success_deals = sorted(
+            success_deals,
+            key=lambda deal: parse_jalali_datetime(deal.get("updated_at", "") or deal.get("created_at", "")) or datetime.min,
+        )
+        for deal in success_deals:
+            rows.append(
+                {
+                    "sales_expert": self.profile.title,
+                    "success_at": deal.get("updated_at", "") or deal.get("created_at", ""),
+                    "deal_type": deal.get("deal_type", ""),
+                    "product": deal.get("product", ""),
+                    "sale_price": deal.get("sale_price", ""),
+                    "operator_commission": deal.get("operator_commission", ""),
+                }
+            )
+        return rows
+
     def selected_customer(self) -> dict | None:
         selected = self.customer_tree.selection()
         return next((item for item in self._customers if selected and item["id"] == selected[0]), None)
@@ -3593,8 +4376,8 @@ class CRMApp(tb.Toplevel):
         self.customer_tree.selection_set(customer_id)
         self.customer_tree.focus(customer_id)
         self.customer_tree.see(customer_id)
-        related_deals = [deal for deal in self._deals if deal.get("customer_id") == customer_id]
-        CustomerDialog(self, customer, related_deals, self.open_deal_by_id, [row["mobile"] for row in self.store.customers()])
+        related_deals = self.related_deals_for_customer(customer)
+        CustomerDialog(self, customer, related_deals, self.open_deal_by_id, self.all_customer_phones())
 
     def selected_deal(self) -> dict | None:
         selected = self.deal_tree.selection()
@@ -3605,7 +4388,7 @@ class CRMApp(tb.Toplevel):
         return next((item for item in self._deals if selected and item["id"] == selected[0]), None)
 
     def add_customer(self):
-        dialog = CustomerDialog(self, existing_mobiles=[row["mobile"] for row in self.store.customers()])
+        dialog = CustomerDialog(self, existing_mobiles=self.all_customer_phones())
         if not dialog.result:
             return
         rows = self.store.customers()
@@ -3614,6 +4397,7 @@ class CRMApp(tb.Toplevel):
                 "id": uuid.uuid4().hex,
                 "name": dialog.result["name"],
                 "mobile": dialog.result["mobile"],
+                "mobile2": dialog.result.get("mobile2", ""),
                 "birthdate": dialog.result["birthdate"],
                 "income_level": dialog.result["income_level"],
                 "birthday_notified_for": "",
@@ -3625,13 +4409,35 @@ class CRMApp(tb.Toplevel):
         self.store.save_customers(rows)
         self.refresh_everything()
 
+    def create_customer_for_deal_dialog(self) -> dict | None:
+        dialog = CustomerDialog(self, existing_mobiles=self.all_customer_phones())
+        if not dialog.result:
+            return None
+        customer_row = {
+            "id": uuid.uuid4().hex,
+            "name": dialog.result["name"],
+            "mobile": dialog.result["mobile"],
+            "mobile2": dialog.result.get("mobile2", ""),
+            "birthdate": dialog.result["birthdate"],
+            "income_level": dialog.result["income_level"],
+            "birthday_notified_for": "",
+            "birthday_seen_for": "",
+            "created_at": now_text(),
+            "updated_at": now_text(),
+        }
+        rows = self.store.customers()
+        rows.append(customer_row)
+        self.store.save_customers(rows)
+        self.refresh_everything()
+        return customer_row
+
     def edit_customer(self):
         customer = self.selected_customer()
         if not customer:
             Messagebox.show_warning("ابتدا یک مشتری را انتخاب کنید.", "مشتری", parent=self)
             return
-        related_deals = [deal for deal in self._deals if deal.get("customer_id") == customer["id"]]
-        dialog = CustomerDialog(self, customer, related_deals, self.open_deal_by_id, [row["mobile"] for row in self.store.customers()])
+        related_deals = self.related_deals_for_customer(customer)
+        dialog = CustomerDialog(self, customer, related_deals, self.open_deal_by_id, self.all_customer_phones())
         if not dialog.result:
             return
         rows = self.store.customers()
@@ -3661,10 +4467,21 @@ class CRMApp(tb.Toplevel):
         if not self._customers:
             Messagebox.show_warning("ابتدا حداقل یک مشتری ثبت کنید.", "معامله", parent=self)
             return
-        dialog = DealDialog(self, self._customers, self._categories, self._pipelines, self._deal_types, self._products, existing_deals=self._deals)
+        dialog = DealDialog(
+            self,
+            self._customers,
+            self._categories,
+            self._pipelines,
+            self._deal_types,
+            self._products,
+            existing_deals=self._deals,
+            note_templates=self.note_templates(),
+            save_note_templates_callback=self.save_note_templates,
+            create_customer_callback=self.create_customer_for_deal_dialog,
+        )
         if not dialog.result:
             return
-        customer = next((item for item in self._customers if item["name"] == dialog.result["customer_name"]), None)
+        customer = self.resolve_customer_record(dialog.result["customer_name"])
         reminder_dt = parse_jalali_datetime(dialog.result["reminder_at"])
         rows = self.store.deals()
         rows.append(
@@ -3700,10 +4517,22 @@ class CRMApp(tb.Toplevel):
         if not deal:
             Messagebox.show_warning("ابتدا یک معامله را انتخاب کنید.", "معامله", parent=self)
             return
-        dialog = DealDialog(self, self._customers, self._categories, self._pipelines, self._deal_types, self._products, existing_deals=self._deals, deal=deal)
+        dialog = DealDialog(
+            self,
+            self._customers,
+            self._categories,
+            self._pipelines,
+            self._deal_types,
+            self._products,
+            existing_deals=self._deals,
+            deal=deal,
+            note_templates=self.note_templates(),
+            save_note_templates_callback=self.save_note_templates,
+            create_customer_callback=self.create_customer_for_deal_dialog,
+        )
         if not dialog.result:
             return
-        customer = next((item for item in self._customers if item["name"] == dialog.result["customer_name"]), None)
+        customer = self.resolve_customer_record(dialog.result["customer_name"], deal.get("customer_id", ""))
         reminder_dt = parse_jalali_datetime(dialog.result["reminder_at"])
         rows = self.store.deals()
         for row in rows:
@@ -3718,12 +4547,47 @@ class CRMApp(tb.Toplevel):
     def edit_selected_deal_from(self, tree):
         self._edit_deal_object(self.selected_deal_from_tree(tree))
 
+    def resolve_customer_record(self, customer_name: str, fallback_customer_id: str = "") -> dict | None:
+        raw_name = (customer_name or "").strip()
+        normalized_name = normalize_keyboard_text(raw_name)
+        for item in self._customers:
+            if (item.get("name") or "").strip() == raw_name:
+                return item
+        for item in self._customers:
+            if normalize_keyboard_text((item.get("name") or "").strip()) == normalized_name:
+                return item
+        if fallback_customer_id:
+            return next((item for item in self._customers if item.get("id") == fallback_customer_id), None)
+        return None
+
+    def related_deals_for_customer(self, customer: dict) -> list[dict]:
+        customer_id = customer.get("id", "")
+        customer_name = (customer.get("name") or "").strip()
+        normalized_name = normalize_keyboard_text(customer_name)
+        related = []
+        seen_ids = set()
+        for deal in self._deals:
+            deal_id = deal.get("id", "")
+            if not deal_id or deal_id in seen_ids:
+                continue
+            deal_customer_id = (deal.get("customer_id") or "").strip()
+            deal_customer_name = (deal.get("customer_name") or "").strip()
+            if deal_customer_id and deal_customer_id == customer_id:
+                related.append(deal)
+                seen_ids.add(deal_id)
+                continue
+            if normalized_name and normalize_keyboard_text(deal_customer_name) == normalized_name:
+                related.append(deal)
+                seen_ids.add(deal_id)
+        return related
+
     def open_notification_deal(self, event=None):
         item_id = ""
         if event is not None:
-            item_id = self.notifications_tree.identify_row(event.y)
-            if item_id:
-                self.notifications_tree.selection_set(item_id)
+            if hasattr(event, "y"):
+                item_id = self.notifications_tree.identify_row(event.y)
+                if item_id:
+                    self.notifications_tree.selection_set(item_id)
         if not item_id:
             selected = self.notifications_tree.selection()
             if not selected:
@@ -3737,10 +4601,18 @@ class CRMApp(tb.Toplevel):
         if not deal:
             return
         self.notebook.select(self.deals_tab)
-        self.deal_tree.selection_set(deal["id"])
-        self.deal_tree.focus(deal["id"])
-        self.deal_tree.see(deal["id"])
-        self._edit_deal_object(deal)
+        filtered_rows = self.filtered_deals_for_page()
+        visible_ids = {row["id"] for row in filtered_rows}
+        if deal["id"] in visible_ids:
+            page_size = self.current_page_size(self.deal_tree)
+            row_index = next((index for index, row in enumerate(filtered_rows) if row["id"] == deal["id"]), 0)
+            self.deal_page = max(1, (row_index // page_size) + 1)
+            self.refresh_deal_tree()
+            if deal["id"] in self.deal_tree.get_children():
+                self.deal_tree.selection_set(deal["id"])
+                self.deal_tree.focus(deal["id"])
+                self.deal_tree.see(deal["id"])
+        self.after(10, lambda current_deal=deal: self._edit_deal_object(current_deal))
 
     def mark_deal_notification_seen(self, deal_id: str):
         rows = self.store.deals()
@@ -3797,6 +4669,24 @@ class CRMApp(tb.Toplevel):
             self.refresh_everything()
         self.check_birthdays()
         self.after(self.reminder_poll_ms, self.check_reminders)
+
+    def sync_overdue_reminders_on_startup(self):
+        now = datetime.now()
+        rows = self.store.deals()
+        changed = False
+        for deal in rows:
+            reminder_at = deal.get("reminder_at", "")
+            if not reminder_at:
+                continue
+            due = parse_jalali_datetime(reminder_at)
+            if due is None or due > now:
+                continue
+            if deal.get("last_notified_at", "") == reminder_at:
+                continue
+            deal["last_notified_at"] = reminder_at
+            changed = True
+        if changed:
+            self.store.save_deals(rows)
 
     def raise_notification(self, deal: dict):
         title = f"یادآور معامله: {deal['title']}"
